@@ -36,8 +36,8 @@
 //!
 //! What the caller supplies:
 //!
-//! - the quotas, from its configuration: [`set_limit`](Lease::set_limit);
-//! - its own usage at boot, from durable storage: [`restore`](Lease::restore);
+//! - the limits, from its configuration, a stock's own usage from durable storage inside:
+//!   [`set_limit`](Lease::set_limit);
 //! - the cluster view, from Raft: [`set_cluster_view`](Lease::set_cluster_view) -- members,
 //!   leader and term;
 //! - the upstream peer, from its overlay: [`set_upstream`](Lease::set_upstream) -- whichever
@@ -88,26 +88,47 @@ impl Default for Config {
     }
 }
 
-/// What a limit counts, which also decides what a node does without a good lease.
+/// One limit, as configured. Which arm it is decides what a node does without a good lease.
+/// Every node needs `chunk`; only the leader uses `limit`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LimitKind {
+pub enum Limit {
+    /// A flow: `limit` units per tick, asked for `chunk` at a time. A share of the refill,
+    /// run as a token bucket. Admitted without a lease.
+    Rate {
+        /// Units per tick, cluster-wide.
+        limit: u64,
+        /// How much a node asks for at a time, and keeps in hand when idle.
+        chunk: u64,
+    },
     /// A stock: bytes, objects. Drawn on, reported, given back. Refused without a lease.
-    Stock,
-    /// A flow, in units per tick. A share of the refill, run as a token bucket. Admitted
-    /// without a lease.
-    Rate,
+    /// Comes with this node's own usage from durable storage; usage only grows and merges by
+    /// max, so passing it again later, even stale, is harmless.
+    Stock {
+        /// Units, cluster-wide.
+        limit: u64,
+        /// How much a node asks for at a time, and keeps in hand when idle.
+        chunk: u64,
+        /// What this node has ever acquired.
+        acquired: u64,
+        /// What this node has ever released.
+        released: u64,
+    },
 }
 
-/// One limit, as configured. Every node needs `kind` and `chunk`; only the leader uses
-/// `limit`.
-#[derive(Clone, Copy, Debug)]
-pub struct Limit {
-    /// What it counts.
-    pub kind: LimitKind,
-    /// The ceiling: units for a stock, units per tick for a rate.
-    pub limit: u64,
-    /// How much a node asks for at a time, and keeps in hand when idle.
-    pub chunk: u64,
+impl Limit {
+    fn is_stock(&self) -> bool {
+        matches!(self, Limit::Stock { .. })
+    }
+    fn limit(&self) -> u64 {
+        match self {
+            Limit::Rate { limit, .. } | Limit::Stock { limit, .. } => *limit,
+        }
+    }
+    fn chunk(&self) -> u64 {
+        match self {
+            Limit::Rate { chunk, .. } | Limit::Stock { chunk, .. } => *chunk,
+        }
+    }
 }
 
 /// One item of a [`Message`].
@@ -345,7 +366,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     // ------------------------------------------------------------ configuration
 
-    /// Add or change a quota. On the leader, the grant becomes the limit at once.
+    /// Add or change a limit. A stock's usage is merged in (by max, so it may be repeated);
+    /// on the leader, the grant becomes the limit at once.
     pub fn set_limit(&mut self, key: K, limit: Limit) -> bool {
         let was_empty = self.outbound.is_empty();
         let me = self.me.clone();
@@ -353,8 +375,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let q = self
             .quotas
             .entry(key)
-            .or_insert_with(|| Quota::new(me, limit));
+            .or_insert_with(|| Quota::new(me.clone(), limit));
         q.limit = limit;
+        if let Limit::Stock {
+            acquired, released, ..
+        } = limit
+        {
+            q.cap.apply(&[(me, acquired, released)]);
+        }
         if leader {
             Self::hold_limit(q, term);
         }
@@ -373,14 +401,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             }
         }
         self.woke(was_empty)
-    }
-
-    /// This node's own usage of a stock, from durable storage, at boot.
-    pub fn restore(&mut self, key: &K, acquired: u64, released: u64) {
-        let me = self.me.clone();
-        if let Some(q) = self.quotas.get_mut(key) {
-            q.cap.apply(&[(me, acquired, released)]);
-        }
     }
 
     // ------------------------------------------------------------ the cluster
@@ -555,7 +575,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         continue;
                     };
                     let used: u64 = usage.iter().map(|(_, a, r)| a.saturating_sub(*r)).sum();
-                    if q.limit.kind == LimitKind::Stock {
+                    if q.limit.is_stock() {
                         q.cap.apply(&usage);
                     }
                     let b = q.children.entry(from.clone()).or_insert(Booking {
@@ -582,7 +602,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     b.expires = now + ttl;
                     let grace = Self::grace(ttl);
                     let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
-                    let cuts_apply = q.limit.kind == LimitKind::Stock;
+                    let cuts_apply = q.limit.is_stock();
                     let hold = if !cuts_apply || settling || !long_enough {
                         booked
                     } else {
@@ -685,7 +705,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
         // Flows refill; children lapse; over-commit is timed.
         for q in self.quotas.values_mut() {
-            if q.limit.kind == LimitKind::Rate {
+            if !q.limit.is_stock() {
                 let refill = q.refill();
                 q.tokens = (q.tokens + refill * n as f64).min(refill.max(1.0) * 2.0);
             }
@@ -761,7 +781,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 LimitKind::Stock => q.room(),
                 LimitKind::Rate => q.tokens.floor() as u64,
             };
-            let rate = q.limit.kind == LimitKind::Rate;
+            let rate = !q.limit.is_stock();
             let ok = (good && have >= *amount) || (!good && rate);
             if !good || have < *amount {
                 // Short, or unleased: ask, whatever becomes of this write. A key newly in
@@ -769,7 +789,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 if q.wanted == 0 {
                     self.dirty = true;
                 }
-                q.wanted = q.wanted.max(q.limit.chunk).max(*amount);
+                q.wanted = q.wanted.max(q.limit.chunk()).max(*amount);
             }
             if !ok {
                 return Err(Denied {
@@ -783,15 +803,15 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 continue;
             };
             let good = leader || (q.term == term && now <= q.valid_until);
-            match q.limit.kind {
-                LimitKind::Stock => {
+            match q.limit {
+                Limit::Stock { .. } => {
                     if !good || q.room() < *amount {
                         // Writing without a lease: self-granted, reported, absorbed above.
                         q.cap.grant(*amount);
                     }
                     q.cap.acquire(*amount).ok();
                 }
-                LimitKind::Rate => {
+                Limit::Rate { .. } => {
                     if good {
                         q.tokens -= *amount as f64;
                     }
@@ -804,7 +824,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     /// Give `amount` of a stock back: a delete, an abort, an expiry.
     pub fn release(&mut self, key: &K, amount: u64) {
         if let Some(q) = self.quotas.get_mut(key) {
-            if q.limit.kind == LimitKind::Stock {
+            if q.limit.is_stock() {
                 q.cap.release(amount);
             }
         }
@@ -865,9 +885,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     fn hold_limit(q: &mut Quota<Id>, term: u64) {
-        let more = q.limit.limit.saturating_sub(q.cap.granted());
+        let more = q.limit.limit().saturating_sub(q.cap.granted());
         q.cap.grant(more);
-        let over = q.cap.granted().saturating_sub(q.limit.limit);
+        let over = q.cap.granted().saturating_sub(q.limit.limit());
         let _ = q.cap.reclaim(over);
         q.term = term;
         q.valid_until = u64::MAX;
@@ -1123,17 +1143,17 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 || q.reported > 0
                 || q.lent > 0
                 || q.wanted > 0
-                || (q.limit.kind == LimitKind::Stock && q.cap.global_used() > 0);
+                || (q.limit.is_stock() && q.cap.global_used() > 0);
             if !in_play {
                 continue;
             }
             // Hand back room beyond two chunks (a stock), or a share beyond what is lent plus
             // one chunk while the bucket is full (a rate).
-            let keep = match q.limit.kind {
-                LimitKind::Stock => 2 * q.limit.chunk,
-                LimitKind::Rate => {
+            let keep = match q.limit {
+                Limit::Stock { .. } => 2 * q.limit.chunk(),
+                Limit::Rate { .. } => {
                     if q.tokens >= q.refill().max(1.0) * 2.0 {
-                        q.limit.chunk
+                        q.limit.chunk()
                     } else {
                         u64::MAX
                     }
@@ -1154,7 +1174,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             items.push(Item::Renew {
                 key: key.clone(),
                 granted: q.cap.granted(),
-                usage: if q.limit.kind == LimitKind::Stock {
+                usage: if q.limit.is_stock() {
                     q.cap.delta()
                 } else {
                     Vec::new()
@@ -1212,16 +1232,16 @@ mod tests {
     const RPS: &str = "rps";
 
     fn stock() -> Limit {
-        Limit {
-            kind: LimitKind::Stock,
+        Limit::Stock {
             limit: 1000,
             chunk: 100,
+            acquired: 0,
+            released: 0,
         }
     }
 
     fn rate() -> Limit {
-        Limit {
-            kind: LimitKind::Rate,
+        Limit::Rate {
             limit: 30,
             chunk: 2,
         }
@@ -1537,5 +1557,43 @@ mod tests {
         assert_eq!(l.stats(&BYTES).unwrap().used, 0);
         assert!(l.acquire(&[(BYTES, 10), (RPS, 1)]).is_ok());
         assert_eq!(l.stats(&BYTES).unwrap().used, 10);
+    }
+
+    #[test]
+    fn a_stock_s_usage_comes_with_the_limit_and_merges_by_max() {
+        let mut n = node(1);
+        n.set_cluster_view(Some(&[1]), 1, 1);
+        n.set_limit(
+            BYTES,
+            Limit::Stock {
+                limit: 1000,
+                chunk: 100,
+                acquired: 300,
+                released: 50,
+            },
+        );
+        assert_eq!(n.usage(&BYTES), 250);
+        n.acquire(&[(BYTES, 10)]).unwrap();
+        // A stale restore changes nothing; a newer one is taken.
+        n.set_limit(
+            BYTES,
+            Limit::Stock {
+                limit: 1000,
+                chunk: 100,
+                acquired: 0,
+                released: 0,
+            },
+        );
+        assert_eq!(n.usage(&BYTES), 260);
+        n.set_limit(
+            BYTES,
+            Limit::Stock {
+                limit: 1000,
+                chunk: 100,
+                acquired: 400,
+                released: 50,
+            },
+        );
+        assert_eq!(n.usage(&BYTES), 350);
     }
 }

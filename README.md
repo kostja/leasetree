@@ -33,12 +33,21 @@ a new leader that lends nothing until every old lease is booked again.
 ## Driving it
 
 ```rust,ignore
-use leasetree::{Lease, Config, Limit, LimitKind, Action};
+use leasetree::{Lease, Config, Limit, Action};
 
-// Boot: the quotas from configuration, own usage from durable storage, the view from Raft.
+// Boot: the limits from configuration, a stock's own usage from durable storage inside it,
+// the view from Raft.
 let mut lease = Lease::new(my_raft_id, Config { ttl: 40 });
-for row in quota_table { lease.set_limit(row.key(), row.limit()); }
-for row in usage_table { lease.restore(&row.key, row.acquired, row.released); }
+for row in quota_table {
+    let limit = match row.kind {
+        Kind::Rate => Limit::Rate { limit: row.value, chunk: row.chunk },
+        Kind::Stock => {
+            let (acquired, released) = usage_table.own(&row.key);
+            Limit::Stock { limit: row.value, chunk: row.chunk, acquired, released }
+        }
+    };
+    lease.set_limit(row.key(), limit);
+}
 lease.set_cluster_view(Some(&instances), leader, term);
 
 // On every system-table change.
