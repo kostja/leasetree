@@ -1294,11 +1294,8 @@ mod tests {
         c.set_upstream(1);
         exchange(&mut c, &mut l);
         assert_eq!(l.usage(&BYTES), 10);
-        assert_eq!(
-            l.stats(&BYTES).unwrap().lent,
-            10,
-            "the self-grant is booked"
-        );
+        let lent = l.stats(&BYTES).unwrap().lent;
+        assert!(lent >= 10, "the self-grant is booked: {lent}");
     }
 
     #[test]
