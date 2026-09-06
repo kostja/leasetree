@@ -139,6 +139,8 @@ pub enum Item<Id, K> {
         granted: u64,
         /// `(node, acquired, released)` for every node under it, itself included.
         usage: Vec<(Id, u64, u64)>,
+        /// What the child still wants; the parent keeps that much earmarked for it.
+        wanted: u64,
     },
     /// child -> parent: I no longer hold `amount` of what you lent me.
     Release {
@@ -526,6 +528,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     key,
                     granted,
                     usage,
+                    wanted,
                 } => {
                     let link = self.links.entry(from.clone()).or_insert(Link {
                         members: BTreeSet::new(),
@@ -561,6 +564,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     q.lent = q.lent - b.granted + booked;
                     b.granted = booked;
                     b.used = used;
+                    b.wanted = wanted;
                     b.expires = now + ttl;
                     let grace = Self::grace(ttl);
                     let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
@@ -733,8 +737,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 Kind::Flow => q.tokens.floor() as u64,
             };
             let ok = (good && have >= *amount) || (!good && q.limit.policy == Policy::Allow);
-            if !ok {
+            if !good || have < *amount {
+                // Short, or unleased: ask, whatever the policy decides about this write.
                 q.wanted = q.wanted.max(q.limit.chunk).max(*amount);
+            }
+            if !ok {
                 return Err(Denied {
                     key: key.clone(),
                     available: have,
@@ -1106,6 +1113,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 } else {
                     Vec::new()
                 },
+                wanted: q.wanted.max(q.overcommit()),
             });
         }
         items.extend(self.requests());
