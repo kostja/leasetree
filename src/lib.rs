@@ -777,9 +777,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 continue;
             };
             let good = leader || (q.term == term && now <= q.valid_until);
-            let have = match q.limit.kind {
-                LimitKind::Stock => q.room(),
-                LimitKind::Rate => q.tokens.floor() as u64,
+            let have = if q.limit.is_stock() {
+                q.room()
+            } else {
+                q.tokens.floor() as u64
             };
             let rate = !q.limit.is_stock();
             let ok = (good && have >= *amount) || (!good && rate);
