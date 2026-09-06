@@ -228,6 +228,9 @@ struct Booking {
     expires: u64,
     /// When we last gave this child more: a report sent before that is stale by the gift.
     given_at: u64,
+    /// What the child asked for and did not get: earmarked, so that what we fetch for it is
+    /// not handed back as spare before it asks again.
+    wanted: u64,
 }
 
 /// One quota's state on this node.
@@ -277,6 +280,10 @@ impl<Id: Ord + Clone> Quota<Id> {
     }
     fn refill(&self) -> f64 {
         self.cap.granted().saturating_sub(self.lent) as f64
+    }
+    /// What the children asked for and did not get.
+    fn earmarked(&self) -> u64 {
+        self.children.values().map(|b| b.wanted).sum()
     }
 }
 
@@ -490,14 +497,19 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                             used: 0,
                             expires: now + ttl,
                             given_at: now,
+                            wanted: 0,
                         });
                         b.granted += give;
                         b.expires = now + ttl;
                         b.given_at = now;
                         q.lent += give;
                     }
-                    if give < want {
-                        q.wanted = q.wanted.max(want - give);
+                    let short = want - give;
+                    if let Some(b) = q.children.get_mut(&from) {
+                        b.wanted = short;
+                    }
+                    if short > 0 {
+                        q.wanted = q.wanted.max(short);
                     }
                     reply.push(Item::Grant {
                         key,
@@ -530,6 +542,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         used: 0,
                         expires: 0,
                         given_at: 0,
+                        wanted: 0,
                     });
                     // A report sent before our last gift reached the child does not include
                     // it: keep the booking.
@@ -1019,7 +1032,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         u64::MAX
                     }
                 }
-            };
+            }
+            .saturating_add(q.earmarked());
             let spare = q.room();
             if spare > keep {
                 let back = q.cap.reclaim(spare - keep);
