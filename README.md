@@ -18,10 +18,11 @@ it holds to its own children. A node draws on its lease locally. Usage flows up 
 a per-node map, merged at every level, so the leader's total is exact and a branch that moves in
 the tree is never counted twice.
 
-A **stock** is a total, such as bytes or objects stored: drawn on, reported, and given back on a
-delete. A **flow** is a rate, such as requests per tick: a node holds a share of the refill and
-runs a token bucket from it. Without a good lease a node either writes anyway (`Allow`) or
-refuses (`Deny`); that is a per-quota choice.
+A **total** is a stock, such as bytes or objects stored: drawn on, reported, and given back on a
+delete. Without a good lease a node refuses; the limit is precious. A **rate** is a flow, such as
+requests per tick: a node holds a share of the refill and runs a token bucket from it. Without a
+good lease a node admits everything and asks for a lease; availability comes first. Keys that
+have no limit, which is most of them, cost nothing and put nothing on the wire.
 
 The rules the protocol needs are listed in the crate docs. Each was found by a simulation that
 went wrong without it: leases dated from the request, reports on change, demand forwarded up at
@@ -32,7 +33,7 @@ a new leader that lends nothing until every old lease is booked again.
 ## Driving it
 
 ```rust,ignore
-use leasetree::{Lease, Config, Limit, Kind, Policy, Action};
+use leasetree::{Lease, Config, Limit, LimitKind, Action};
 
 // Boot: the quotas from configuration, own usage from durable storage, the view from Raft.
 let mut lease = Lease::new(my_raft_id, Config { ttl: 40 });

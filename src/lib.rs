@@ -15,19 +15,16 @@
 //! [`bcounter`] for the accounting and is meant to sit beside `plumtree-fsm` for the
 //! overlay, but knows nothing of either network.
 //!
-//! # Two kinds of quota
+//! # Two kinds of limit
 //!
-//! A **stock** is a total: bytes stored, objects stored. A node draws on its lease, reports
-//! what it drew, and gives back a delete. The leader's `usage` is the cluster's total.
+//! A **total** is a stock: bytes stored, objects stored. A node draws on its lease, reports
+//! what it drew, and gives back a delete. The leader's `usage` is the cluster's total. A total
+//! is precious: without a good lease -- lapsed, or not yet confirmed in the current term -- a
+//! node refuses, and a false denial is the price.
 //!
-//! A **flow** is a rate: requests or bytes per tick. A node holds a share of the refill and
-//! runs a token bucket from it. Nothing is reported; a share not renewed lapses.
-//!
-//! # Two policies
-//!
-//! Without a good lease -- lapsed, or not yet confirmed in the current term -- a node either
-//! writes anyway (`Allow`: availability first; the write is reported and the tree absorbs
-//! the over-commit) or refuses (`Deny`: the limit first; a false denial is the price).
+//! A **rate** is a flow: requests or bytes per tick. A node holds a share of the refill and
+//! runs a token bucket from it. Nothing is reported; a share not renewed lapses. A rate is
+//! about availability: without a good lease a node admits everything and asks for a lease.
 //!
 //! # The contract
 //!
@@ -91,33 +88,23 @@ impl Default for Config {
     }
 }
 
-/// What a quota counts.
+/// What a limit counts, which also decides what a node does without a good lease.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Kind {
-    /// A total: bytes, objects. Drawn on, reported, given back.
-    Stock,
-    /// A rate, in units per tick. A share of the refill, run as a token bucket.
-    Flow,
+pub enum LimitKind {
+    /// A stock: bytes, objects. Drawn on, reported, given back. Refused without a lease.
+    Total,
+    /// A flow, in units per tick. A share of the refill, run as a token bucket. Admitted
+    /// without a lease.
+    Rate,
 }
 
-/// What a node does without a good lease.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Policy {
-    /// Write anyway; the tree absorbs the over-commit.
-    Allow,
-    /// Refuse until the lease is confirmed.
-    Deny,
-}
-
-/// One quota, as configured. Every node needs `kind`, `policy` and `chunk`; only the leader
-/// uses `limit`.
+/// One limit, as configured. Every node needs `kind` and `chunk`; only the leader uses
+/// `limit`.
 #[derive(Clone, Copy, Debug)]
 pub struct Limit {
     /// What it counts.
-    pub kind: Kind,
-    /// What to do without a good lease.
-    pub policy: Policy,
-    /// The ceiling: units for a stock, units per tick for a flow.
+    pub kind: LimitKind,
+    /// The ceiling: units for a total, units per tick for a rate.
     pub limit: u64,
     /// How much a node asks for at a time, and keeps in hand when idle.
     pub chunk: u64,
@@ -209,19 +196,27 @@ pub struct Denied<K> {
     pub available: u64,
 }
 
-/// A quota as this node sees it, for metrics.
+/// A limit as this node sees it, for metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stats {
     /// What this node holds.
     pub granted: u64,
-    /// This node's own usage (stocks).
+    /// This node's own usage (totals).
     pub used: u64,
     /// What it lent to its children.
     pub lent: u64,
     /// What it lent beyond what it holds.
     pub overcommit: u64,
+    /// What it still wants from its parent.
+    pub wanted: u64,
+    /// Children it books for this limit.
+    pub children: usize,
+    /// Tokens in the bucket (rates).
+    pub tokens: u64,
     /// Whether the lease is good right now.
     pub good: bool,
+    /// Until when, in ticks (`u64::MAX` on the leader).
+    pub valid_until: u64,
 }
 
 /// What a parent books for one child on one quota.
@@ -363,11 +358,18 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
-    /// Forget a quota. Whatever it held is dropped; the parent lapses it.
+    /// Forget a limit: hand back to the parent whatever was held, and drop the key entirely.
+    /// Children holding it lapse; their own configuration drops it too.
     pub fn remove_limit(&mut self, key: &K) -> bool {
-        self.quotas.remove(key);
-        self.dirty = true;
-        false
+        let was_empty = self.outbound.is_empty();
+        if let Some(q) = self.quotas.remove(key) {
+            if let Some(p) = self.parent.clone() {
+                if q.cap.granted() > 0 {
+                    self.send_releases(p, vec![(key.clone(), q.cap.granted())]);
+                }
+            }
+        }
+        self.woke(was_empty)
     }
 
     /// This node's own usage of a stock, from durable storage, at boot.
@@ -550,7 +552,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         continue;
                     };
                     let used: u64 = usage.iter().map(|(_, a, r)| a.saturating_sub(*r)).sum();
-                    if q.limit.kind == Kind::Stock {
+                    if q.limit.kind == LimitKind::Total {
                         q.cap.apply(&usage);
                     }
                     let b = q.children.entry(from.clone()).or_insert(Booking {
@@ -577,7 +579,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     b.expires = now + ttl;
                     let grace = Self::grace(ttl);
                     let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
-                    let hold = if q.limit.policy == Policy::Allow || settling || !long_enough {
+                    let cuts_apply = q.limit.kind == LimitKind::Total;
+                    let hold = if !cuts_apply || settling || !long_enough {
                         booked
                     } else {
                         booked - q.overcommit().min(booked.saturating_sub(used))
@@ -677,7 +680,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
         // Flows refill; children lapse; over-commit is timed.
         for q in self.quotas.values_mut() {
-            if q.limit.kind == Kind::Flow {
+            if q.limit.kind == LimitKind::Rate {
                 let refill = q.refill();
                 q.tokens = (q.tokens + refill * n as f64).min(refill.max(1.0) * 2.0);
             }
@@ -750,12 +753,13 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             };
             let good = leader || (q.term == term && now <= q.valid_until);
             let have = match q.limit.kind {
-                Kind::Stock => q.room(),
-                Kind::Flow => q.tokens.floor() as u64,
+                LimitKind::Total => q.room(),
+                LimitKind::Rate => q.tokens.floor() as u64,
             };
-            let ok = (good && have >= *amount) || (!good && q.limit.policy == Policy::Allow);
+            let rate = q.limit.kind == LimitKind::Rate;
+            let ok = (good && have >= *amount) || (!good && rate);
             if !good || have < *amount {
-                // Short, or unleased: ask, whatever the policy decides about this write.
+                // Short, or unleased: ask, whatever becomes of this write.
                 q.wanted = q.wanted.max(q.limit.chunk).max(*amount);
             }
             if !ok {
@@ -771,14 +775,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             };
             let good = leader || (q.term == term && now <= q.valid_until);
             match q.limit.kind {
-                Kind::Stock => {
+                LimitKind::Total => {
                     if !good || q.room() < *amount {
                         // Writing without a lease: self-granted, reported, absorbed above.
                         q.cap.grant(*amount);
                     }
                     q.cap.acquire(*amount).ok();
                 }
-                Kind::Flow => {
+                LimitKind::Rate => {
                     if good {
                         q.tokens -= *amount as f64;
                     }
@@ -791,7 +795,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     /// Give `amount` of a stock back: a delete, an abort, an expiry.
     pub fn release(&mut self, key: &K, amount: u64) {
         if let Some(q) = self.quotas.get_mut(key) {
-            if q.limit.kind == Kind::Stock {
+            if q.limit.kind == LimitKind::Total {
                 q.cap.release(amount);
             }
         }
@@ -828,7 +832,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             used: q.cap.granted().saturating_sub(q.cap.local_available()),
             lent: q.lent,
             overcommit: q.overcommit(),
+            wanted: q.wanted,
+            children: q.children.len(),
+            tokens: q.tokens.floor() as u64,
             good: self.is_leader() || (q.term == self.term && self.now <= q.valid_until),
+            valid_until: q.valid_until,
         })
     }
 
@@ -1101,11 +1109,19 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.last_renew = now;
         let mut items = Vec::new();
         for (key, q) in self.quotas.iter_mut() {
-            // Hand back room beyond two chunks (a stock), or a share beyond what is lent plus
-            // one chunk while the bucket is full (a flow).
+            // A limit this node neither holds, lends, wants nor has used is not mentioned.
+            let in_play = q.cap.granted() > 0
+                || q.lent > 0
+                || q.wanted > 0
+                || (q.limit.kind == LimitKind::Total && q.cap.global_used() > 0);
+            if !in_play {
+                continue;
+            }
+            // Hand back room beyond two chunks (a total), or a share beyond what is lent plus
+            // one chunk while the bucket is full (a rate).
             let keep = match q.limit.kind {
-                Kind::Stock => 2 * q.limit.chunk,
-                Kind::Flow => {
+                LimitKind::Total => 2 * q.limit.chunk,
+                LimitKind::Rate => {
                     if q.tokens >= q.refill().max(1.0) * 2.0 {
                         q.limit.chunk
                     } else {
@@ -1127,7 +1143,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             items.push(Item::Renew {
                 key: key.clone(),
                 granted: q.cap.granted(),
-                usage: if q.limit.kind == Kind::Stock {
+                usage: if q.limit.kind == LimitKind::Total {
                     q.cap.delta()
                 } else {
                     Vec::new()
@@ -1136,6 +1152,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             });
         }
         items.extend(self.requests());
+        // Nothing in play: nothing on the wire. Most keys never have a limit set.
+        if items.is_empty() {
+            return;
+        }
         let m = self.envelope(None, true, items);
         self.outbound.push(Action::Send(parent, m));
     }
@@ -1180,19 +1200,17 @@ mod tests {
     const BYTES: &str = "bytes";
     const RPS: &str = "rps";
 
-    fn stock(policy: Policy) -> Limit {
+    fn total() -> Limit {
         Limit {
-            kind: Kind::Stock,
-            policy,
+            kind: LimitKind::Total,
             limit: 1000,
             chunk: 100,
         }
     }
 
-    fn flow() -> Limit {
+    fn rate() -> Limit {
         Limit {
-            kind: Kind::Flow,
-            policy: Policy::Deny,
+            kind: LimitKind::Rate,
             limit: 30,
             chunk: 2,
         }
@@ -1200,8 +1218,8 @@ mod tests {
 
     fn node(id: u32) -> Lease<u32, &'static str> {
         let mut n = Lease::new(id, Config { ttl: 40 });
-        n.set_limit(BYTES, stock(Policy::Deny));
-        n.set_limit(RPS, flow());
+        n.set_limit(BYTES, total());
+        n.set_limit(RPS, rate());
         n
     }
 
@@ -1319,19 +1337,64 @@ mod tests {
     }
 
     #[test]
-    fn allow_writes_without_a_lease_and_reports_it() {
+    fn a_rate_admits_without_a_lease_and_asks_for_one() {
         let mut l = node(1);
         let mut c = node(2);
-        l.set_limit(BYTES, stock(Policy::Allow));
-        c.set_limit(BYTES, stock(Policy::Allow));
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        assert!(c.acquire(&[(BYTES, 10)]).is_ok(), "no lease, but allow");
+        assert!(c.acquire(&[(RPS, 1)]).is_ok(), "no lease, but a rate");
+        assert!(c.acquire(&[(BYTES, 1)]).is_err(), "no lease, and a total");
         c.set_upstream(1);
         exchange(&mut c, &mut l);
-        assert_eq!(l.usage(&BYTES), 10);
-        let lent = l.stats(&BYTES).unwrap().lent;
-        assert!(lent >= 10, "the self-grant is booked: {lent}");
+        c.tick(1);
+        exchange(&mut c, &mut l);
+        assert!(c.stats(&RPS).unwrap().granted > 0, "and it asked");
+    }
+
+    #[test]
+    fn a_node_with_nothing_in_play_is_silent() {
+        let mut c = node(2);
+        c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        assert!(
+            c.ready().is_empty(),
+            "nothing held, nothing wanted: no report"
+        );
+        c.tick(50);
+        assert!(c.ready().is_empty(), "nor a keepalive");
+        let mut e = Lease::<u32, &str>::new(3, Config { ttl: 40 });
+        e.set_cluster_view(Some(&[1, 3]), 1, 1);
+        e.set_upstream(1);
+        e.tick(50);
+        assert!(
+            e.ready().is_empty(),
+            "no limits at all: nothing on the wire"
+        );
+    }
+
+    #[test]
+    fn removing_a_limit_hands_it_back_and_forgets_it() {
+        let mut l = node(1);
+        let mut c = node(2);
+        l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        exchange(&mut c, &mut l);
+        let _ = c.acquire(&[(BYTES, 10)]);
+        c.tick(1);
+        exchange(&mut c, &mut l);
+        assert_eq!(l.stats(&BYTES).unwrap().lent, 100);
+        c.remove_limit(&BYTES);
+        exchange(&mut c, &mut l);
+        assert_eq!(l.stats(&BYTES).unwrap().lent, 0);
+        assert!(c.stats(&BYTES).is_none());
+        c.tick(20);
+        for Action::Send(_, m) in c.ready() {
+            assert!(!m
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Renew { key, .. } if *key == BYTES)));
+        }
     }
 
     #[test]
