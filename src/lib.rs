@@ -598,7 +598,12 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                             self.dirty = true;
                         }
                     }
-                    if !self.quotas.values().any(|q| q.children.contains_key(&from)) {
+                    let still_child = self.quotas.values().any(|q| {
+                        q.children
+                            .get(&from)
+                            .is_some_and(|b| b.granted > 0 || b.wanted > 0)
+                    });
+                    if !still_child {
                         self.links.remove(&from);
                     }
                 }
@@ -1432,7 +1437,13 @@ mod tests {
             0,
             "the old parent books nothing for it"
         );
-        assert!(!ns[1].children().any(|&x| x == 3));
+        let booked: u64 = ns[1]
+            .quotas
+            .values()
+            .filter_map(|q| q.children.get(&3))
+            .map(|b| b.granted)
+            .sum();
+        assert_eq!(booked, 0, "nor does any booking for it survive");
     }
 
     #[test]
