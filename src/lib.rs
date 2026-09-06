@@ -480,6 +480,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let now = self.now;
         let mut reply: Vec<Item<Id, K>> = Vec::new();
         let mut cuts: Vec<(Id, K, u64)> = Vec::new();
+        let mut pushes: Vec<(Id, K, u64)> = Vec::new();
         let mut confirmed = false;
         for item in msg.items {
             match item {
@@ -509,7 +510,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         b.wanted = short;
                     }
                     if short > 0 {
+                        // New demand from below: ask upward at the next tick, not after the
+                        // retry period.
                         q.wanted = q.wanted.max(short);
+                        q.last_request = None;
                     }
                     reply.push(Item::Grant {
                         key,
@@ -600,6 +604,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     q.cap.grant(amount);
                     if amount > 0 {
                         q.wanted = q.wanted.saturating_sub(amount);
+                        // Room arrived: hand it straight to the children waiting for it,
+                        // rather than making them ask again.
+                        for (c, give) in Self::serve_waiting(q, now, ttl) {
+                            pushes.push((c, key.clone(), give));
+                        }
                     }
                     q.term = q.term.max(msg.term);
                     let dated = msg.in_reply_to.unwrap_or(msg.sent);
@@ -622,6 +631,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         if !cuts.is_empty() {
             self.dirty = true;
             self.send_shrinks(cuts);
+        }
+        if !pushes.is_empty() {
+            self.send_grants(pushes);
         }
         if confirmed {
             self.release_old_parent();
@@ -955,6 +967,48 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             }
         }
         asks
+    }
+
+    /// Give waiting children what they asked for, as far as room allows. Returns the gifts.
+    fn serve_waiting(q: &mut Quota<Id>, now: u64, ttl: u64) -> Vec<(Id, u64)> {
+        let mut gifts = Vec::new();
+        let waiting: Vec<Id> = q
+            .children
+            .iter()
+            .filter(|(_, b)| b.wanted > 0)
+            .map(|(c, _)| c.clone())
+            .collect();
+        for c in waiting {
+            let room = q.room();
+            if room == 0 {
+                break;
+            }
+            let b = q.children.get_mut(&c).expect("listed");
+            let give = b.wanted.min(room);
+            b.granted += give;
+            b.wanted -= give;
+            b.expires = now + ttl;
+            b.given_at = now;
+            q.lent += give;
+            gifts.push((c, give));
+        }
+        gifts
+    }
+
+    fn send_grants(&mut self, gifts: Vec<(Id, K, u64)>) {
+        let mut per_child: BTreeMap<Id, Vec<Item<Id, K>>> = BTreeMap::new();
+        for (c, key, amount) in gifts {
+            per_child.entry(c).or_default().push(Item::Grant {
+                key,
+                amount,
+                renewal: false,
+                hold: u64::MAX,
+            });
+        }
+        for (c, items) in per_child {
+            let m = self.envelope(None, false, items);
+            self.outbound.push(Action::Send(c, m));
+        }
     }
 
     fn send_shrinks(&mut self, cuts: Vec<(Id, K, u64)>) {
