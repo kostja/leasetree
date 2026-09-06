@@ -74,7 +74,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use bcounter::BCounter;
 
-/// Timing, in ticks. The caller decides what a tick is.
+/// Timing, in ticks. The caller decides what a tick is, and drives [`tick`](Lease::tick)
+/// from a **monotonic** clock: a node compares only its own clock readings, so skew between
+/// nodes is harmless, but a clock that steps back keeps a lapsed lease spendable for as long
+/// as it stepped. A pause or a forward jump is fine: a large `tick(n)` lapses everything at
+/// once.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     /// A lease is good for this long without renewal. Renewed at `ttl / 2`. A request is
@@ -1596,5 +1600,69 @@ mod tests {
             },
         );
         assert_eq!(n.usage(&BYTES), 350);
+    }
+
+    #[test]
+    fn the_child_s_lease_ends_before_the_parent_s_booking() {
+        // Dated from sending at the child, from arrival at the parent: the parent can never
+        // re-lend room the child still considers its own.
+        let mut l = node(1);
+        let mut c = node(2);
+        l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        let _ = c.acquire(&[(BYTES, 10)]);
+        // Advance the clocks apart from each other: the child's request goes at 100, arrives
+        // at 101, is acked at 102.
+        c.tick(100);
+        l.tick(101);
+        let mut from_c = c.ready();
+        assert_eq!(from_c.len(), 1);
+        let Action::Send(_, m) = from_c.remove(0);
+        l.on_message(2, m);
+        for Action::Send(_, m) in l.ready() {
+            c.on_message(1, m);
+        }
+        assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
+        assert_eq!(c.stats(&BYTES).unwrap().valid_until, 140, "100 + ttl");
+        c.tick(40); // 140: the last good tick
+        assert!(c.acquire(&[(BYTES, 10)]).is_ok());
+        c.tick(1); // 141
+        assert!(c.acquire(&[(BYTES, 10)]).is_err(), "the child stopped");
+        l.tick(40); // 141: the parent still books it
+        assert_eq!(l.stats(&BYTES).unwrap().lent, 100);
+        l.tick(1); // 142: and only now lets it go
+        assert_eq!(l.stats(&BYTES).unwrap().lent, 0);
+    }
+
+    #[test]
+    fn a_new_term_fences_a_stock_until_confirmed_and_not_a_rate() {
+        let mut l = node(1);
+        let mut c = node(2);
+        l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        let _ = c.acquire(&[(BYTES, 10), (RPS, 1)]);
+        c.tick(1);
+        exchange(&mut c, &mut l);
+        c.tick(1);
+        assert!(c.acquire(&[(BYTES, 10)]).is_ok());
+        assert!(c.acquire(&[(RPS, 1)]).is_ok());
+        // Raft moves on, the same leader wins the new term.
+        c.set_cluster_view(None, 1, 2);
+        assert!(
+            c.acquire(&[(BYTES, 10)]).is_err(),
+            "a stock waits for the new term"
+        );
+        assert!(c.acquire(&[(RPS, 1)]).is_ok(), "a rate admits regardless");
+        assert_eq!(
+            c.stats(&BYTES).unwrap().granted,
+            100,
+            "the lease is kept, not dropped"
+        );
+        l.set_cluster_view(None, 1, 2);
+        c.tick(1);
+        exchange(&mut c, &mut l); // the report goes out at once; the ack carries term 2
+        assert!(c.acquire(&[(BYTES, 10)]).is_ok(), "confirmed");
     }
 }

@@ -27,8 +27,16 @@ Two kinds of limit, and the kind decides what a node does without a good lease:
   a token bucket from it. Nothing is reported. Without a good lease a node admits everything
   and asks for a lease; availability comes first.
 
-A lease is good while it was confirmed in the current term and has not lapsed. Most keys never
-have a limit set; they cost nothing, and a node with nothing in play puts nothing on the wire.
+A lease is good while it was confirmed in the current term and has not lapsed. On a leader
+change a lease is fenced, not dropped: a stock waits for its parent's next ack, which carries
+the new term, and a rate keeps admitting. The old tree's bookings stay valid up to the new
+leader, which adopts them. What the fence does not cover is a leader cut off with part of the
+tree: that side never hears the new term and keeps writing what it already held, until Raft
+makes the old leader step down and its children's leases lapse one `ttl` later. That is the
+bound: the step-down time plus one `ttl`, and never more than the cut-off side held.
+
+Most keys never have a limit set; they cost nothing, and a node with nothing in play puts
+nothing on the wire.
 
 ### The protocol
 
@@ -142,6 +150,11 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 | cut a child, once over-committed for | `ttl / 8` |
 | leave a parent | after it missed two deliveries of the leader's traffic |
 | a new leader's fallback window | `ttl` |
+
+Drive `tick` from a **monotonic clock**, never wall time. A node compares only its own clock
+readings, so skew between nodes is harmless; but a clock that steps back keeps a lapsed lease
+spendable for as long as it stepped. A pause or a forward jump is fine: a large `tick(n)`
+lapses everything at once.
 
 With a tick of 100 ms, `ttl: 40` is a four-second lease, renewed every two seconds. A node
 whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks. A
