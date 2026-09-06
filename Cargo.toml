@@ -1,0 +1,17 @@
+[package]
+name = "leasetree"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+license = "MIT OR Apache-2.0"
+description = "A pure state machine for distributed quotas: leases handed down a spanning tree, usage reported up, TTL'd and term-fenced. No IO, no clock."
+repository = "https://github.com/kostja/leasetree"
+homepage = "https://github.com/kostja/leasetree"
+documentation = "https://docs.rs/leasetree"
+readme = "README.md"
+keywords = ["quota", "lease", "rate-limit", "distributed", "crdt"]
+categories = ["algorithms", "network-programming"]
+authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
+
+[dependencies]
+bcounter = { git = "https://github.com/kostja/bcounter" }
