@@ -759,7 +759,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let rate = q.limit.kind == LimitKind::Rate;
             let ok = (good && have >= *amount) || (!good && rate);
             if !good || have < *amount {
-                // Short, or unleased: ask, whatever becomes of this write.
+                // Short, or unleased: ask, whatever becomes of this write. A key newly in
+                // play is reported at once, so the parent links us and the leader counts us.
+                if q.wanted == 0 {
+                    self.dirty = true;
+                }
                 q.wanted = q.wanted.max(q.limit.chunk).max(*amount);
             }
             if !ok {
@@ -1464,6 +1468,8 @@ mod tests {
         p.set_cluster_view(Some(&[1, 2, 3]), 3, 1);
         c.set_cluster_view(Some(&[1, 2, 3]), 3, 1);
         c.set_upstream(1);
+        let _ = c.acquire(&[(BYTES, 1)]);
+        c.tick(1);
         exchange(&mut c, &mut p); // p now has c as a child
         p.set_upstream(2);
         p.set_upstream(2);
