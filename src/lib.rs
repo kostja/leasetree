@@ -17,8 +17,8 @@
 //!
 //! # Two kinds of limit
 //!
-//! A **total** is a stock: bytes stored, objects stored. A node draws on its lease, reports
-//! what it drew, and gives back a delete. The leader's `usage` is the cluster's total. A total
+//! A **stock** is a total: bytes stored, objects stored. A node draws on its lease, reports
+//! what it drew, and gives back a delete. The leader's `usage` is the cluster's total. A stock
 //! is precious: without a good lease -- lapsed, or not yet confirmed in the current term -- a
 //! node refuses, and a false denial is the price.
 //!
@@ -92,7 +92,7 @@ impl Default for Config {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitKind {
     /// A stock: bytes, objects. Drawn on, reported, given back. Refused without a lease.
-    Total,
+    Stock,
     /// A flow, in units per tick. A share of the refill, run as a token bucket. Admitted
     /// without a lease.
     Rate,
@@ -104,7 +104,7 @@ pub enum LimitKind {
 pub struct Limit {
     /// What it counts.
     pub kind: LimitKind,
-    /// The ceiling: units for a total, units per tick for a rate.
+    /// The ceiling: units for a stock, units per tick for a rate.
     pub limit: u64,
     /// How much a node asks for at a time, and keeps in hand when idle.
     pub chunk: u64,
@@ -201,7 +201,7 @@ pub struct Denied<K> {
 pub struct Stats {
     /// What this node holds.
     pub granted: u64,
-    /// This node's own usage (totals).
+    /// This node's own usage (stocks).
     pub used: u64,
     /// What it lent to its children.
     pub lent: u64,
@@ -555,7 +555,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         continue;
                     };
                     let used: u64 = usage.iter().map(|(_, a, r)| a.saturating_sub(*r)).sum();
-                    if q.limit.kind == LimitKind::Total {
+                    if q.limit.kind == LimitKind::Stock {
                         q.cap.apply(&usage);
                     }
                     let b = q.children.entry(from.clone()).or_insert(Booking {
@@ -582,7 +582,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     b.expires = now + ttl;
                     let grace = Self::grace(ttl);
                     let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
-                    let cuts_apply = q.limit.kind == LimitKind::Total;
+                    let cuts_apply = q.limit.kind == LimitKind::Stock;
                     let hold = if !cuts_apply || settling || !long_enough {
                         booked
                     } else {
@@ -630,6 +630,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     };
                     q.cap.grant(amount);
                     if amount > 0 {
+                        // What the parent gave, it books: as good as reported.
+                        q.reported += amount;
                         q.wanted = q.wanted.saturating_sub(amount);
                         // Room arrived: hand it straight to the children waiting for it,
                         // rather than making them ask again.
@@ -756,7 +758,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             };
             let good = leader || (q.term == term && now <= q.valid_until);
             let have = match q.limit.kind {
-                LimitKind::Total => q.room(),
+                LimitKind::Stock => q.room(),
                 LimitKind::Rate => q.tokens.floor() as u64,
             };
             let rate = q.limit.kind == LimitKind::Rate;
@@ -782,7 +784,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             };
             let good = leader || (q.term == term && now <= q.valid_until);
             match q.limit.kind {
-                LimitKind::Total => {
+                LimitKind::Stock => {
                     if !good || q.room() < *amount {
                         // Writing without a lease: self-granted, reported, absorbed above.
                         q.cap.grant(*amount);
@@ -802,7 +804,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     /// Give `amount` of a stock back: a delete, an abort, an expiry.
     pub fn release(&mut self, key: &K, amount: u64) {
         if let Some(q) = self.quotas.get_mut(key) {
-            if q.limit.kind == LimitKind::Total {
+            if q.limit.kind == LimitKind::Stock {
                 q.cap.release(amount);
             }
         }
@@ -1121,14 +1123,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 || q.reported > 0
                 || q.lent > 0
                 || q.wanted > 0
-                || (q.limit.kind == LimitKind::Total && q.cap.global_used() > 0);
+                || (q.limit.kind == LimitKind::Stock && q.cap.global_used() > 0);
             if !in_play {
                 continue;
             }
-            // Hand back room beyond two chunks (a total), or a share beyond what is lent plus
+            // Hand back room beyond two chunks (a stock), or a share beyond what is lent plus
             // one chunk while the bucket is full (a rate).
             let keep = match q.limit.kind {
-                LimitKind::Total => 2 * q.limit.chunk,
+                LimitKind::Stock => 2 * q.limit.chunk,
                 LimitKind::Rate => {
                     if q.tokens >= q.refill().max(1.0) * 2.0 {
                         q.limit.chunk
@@ -1152,7 +1154,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             items.push(Item::Renew {
                 key: key.clone(),
                 granted: q.cap.granted(),
-                usage: if q.limit.kind == LimitKind::Total {
+                usage: if q.limit.kind == LimitKind::Stock {
                     q.cap.delta()
                 } else {
                     Vec::new()
@@ -1209,9 +1211,9 @@ mod tests {
     const BYTES: &str = "bytes";
     const RPS: &str = "rps";
 
-    fn total() -> Limit {
+    fn stock() -> Limit {
         Limit {
-            kind: LimitKind::Total,
+            kind: LimitKind::Stock,
             limit: 1000,
             chunk: 100,
         }
@@ -1227,7 +1229,7 @@ mod tests {
 
     fn node(id: u32) -> Lease<u32, &'static str> {
         let mut n = Lease::new(id, Config { ttl: 40 });
-        n.set_limit(BYTES, total());
+        n.set_limit(BYTES, stock());
         n.set_limit(RPS, rate());
         n
     }
@@ -1322,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_lapses_without_renewal_and_a_total_refuses() {
+    fn a_lease_lapses_without_renewal_and_a_stock_refuses() {
         let mut l = node(1);
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
@@ -1352,7 +1354,7 @@ mod tests {
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
         assert!(c.acquire(&[(RPS, 1)]).is_ok(), "no lease, but a rate");
-        assert!(c.acquire(&[(BYTES, 1)]).is_err(), "no lease, and a total");
+        assert!(c.acquire(&[(BYTES, 1)]).is_err(), "no lease, and a stock");
         c.set_upstream(1);
         exchange(&mut c, &mut l);
         c.tick(1);

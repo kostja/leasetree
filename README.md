@@ -18,7 +18,7 @@ it holds to its own children. A node draws on its lease locally. Usage flows up 
 a per-node map, merged at every level, so the leader's total is exact and a branch that moves in
 the tree is never counted twice.
 
-A **total** is a stock, such as bytes or objects stored: drawn on, reported, and given back on a
+A **stock** is a total, such as bytes or objects stored: drawn on, reported, and given back on a
 delete. Without a good lease a node refuses; the limit is precious. A **rate** is a flow, such as
 requests per tick: a node holds a share of the refill and runs a token bucket from it. Without a
 good lease a node admits everything and asks for a lease; availability comes first. Keys that
