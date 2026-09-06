@@ -24,10 +24,10 @@ runs a token bucket from it. Without a good lease a node either writes anyway (`
 refuses (`Deny`); that is a per-quota choice.
 
 The rules the protocol needs are listed in the crate docs. Each was found by a simulation that
-went wrong without it: leases dated from the request, reports on change, demand forwarded up,
-releases deferred until the new parent confirms, cuts only after a grace period, parent
-hysteresis, lapsed leases dropped at once, and a new leader that lends nothing until every old
-lease is booked again.
+went wrong without it: leases dated from the request, reports on change, demand forwarded up at
+once and earmarked, room pushed down when it arrives, releases deferred until the new parent
+confirms, cuts only after a grace period, parent hysteresis, lapsed leases dropped at once, and
+a new leader that lends nothing until every old lease is booked again.
 
 ## Driving it
 

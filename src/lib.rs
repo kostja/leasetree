@@ -54,11 +54,14 @@
 //!
 //! - A lease is dated from the tick the request was *sent*, so a parent that lapses it
 //!   (dated from arrival, later) never re-lends room the child still considers its own.
-//! - A child reports whenever its bookings or its term changed, and every `ttl / 2` as a
-//!   keepalive. A parent books what the child reports.
-//! - A parent that cannot fill a request asks its own parent for the shortfall.
-//! - A node that moves to a new parent keeps the old one's booking until the new parent has
-//!   confirmed the adoption; until then both book it and nobody re-lends it.
+//! - A child reports whenever its bookings, its subtree or its term changed, and every
+//!   `ttl / 2` as a keepalive. A parent books what the child reports.
+//! - A parent that cannot fill a request books the child anyway, asks its own parent for the
+//!   shortfall at once, keeps that much earmarked, and pushes room down the moment it arrives.
+//! - A node without a good lease asks for one whatever the policy says about the write.
+//! - A node that moves to a new parent owes the old one everything it held before dropping
+//!   anything, and pays only once the new parent has confirmed the adoption; until then both
+//!   book it and nobody re-lends it.
 //! - Under `Deny`, a parent that booked more than it holds cuts a child only after a grace
 //!   period, never below what the child's subtree has used, and the child passes the cut down.
 //! - A node keeps its parent while that parent keeps delivering the leader's traffic, and
