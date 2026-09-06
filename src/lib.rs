@@ -494,23 +494,23 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         continue;
                     };
                     let give = want.min(q.room());
+                    // Book the child even for nothing: its want is remembered there, and
+                    // room arriving later is pushed to it.
+                    let b = q.children.entry(from.clone()).or_insert(Booking {
+                        granted: 0,
+                        used: 0,
+                        expires: now + ttl,
+                        given_at: now,
+                        wanted: 0,
+                    });
                     if give > 0 {
-                        let b = q.children.entry(from.clone()).or_insert(Booking {
-                            granted: 0,
-                            used: 0,
-                            expires: now + ttl,
-                            given_at: now,
-                            wanted: 0,
-                        });
                         b.granted += give;
-                        b.expires = now + ttl;
                         b.given_at = now;
                         q.lent += give;
                     }
+                    b.expires = now + ttl;
                     let short = want - give;
-                    if let Some(b) = q.children.get_mut(&from) {
-                        b.wanted = short;
-                    }
+                    b.wanted = short;
                     if short > 0 {
                         // New demand from below: ask upward at the next tick, not after the
                         // retry period.
@@ -534,7 +534,13 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                         members: BTreeSet::new(),
                         expires: 0,
                     });
-                    link.members = msg.members.iter().cloned().collect();
+                    let members: BTreeSet<Id> = msg.members.iter().cloned().collect();
+                    if link.members != members {
+                        // Our subtree changed: report it up at once, so a new leader's
+                        // coverage does not wait for the periodic renewal.
+                        self.dirty = true;
+                    }
+                    link.members = members;
                     link.expires = now + ttl;
                     let settling = self.is_leader() && !self.may_grant();
                     let Some(q) = self.quotas.get_mut(&key) else {
@@ -591,6 +597,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                             }
                             self.dirty = true;
                         }
+                    }
+                    if !self.quotas.values().any(|q| q.children.contains_key(&from)) {
+                        self.links.remove(&from);
                     }
                 }
                 Item::Grant {
@@ -901,6 +910,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     fn reparent(&mut self, peer: Id) {
         let now = self.now;
+        // What the old parent books for us is what we held before dropping anything: owe it
+        // all of that, or the dropped part stays booked there until it lapses.
+        let owed: Vec<(K, u64)> = self
+            .quotas
+            .iter()
+            .filter(|(_, q)| q.cap.granted() > 0)
+            .map(|(k, q)| (k.clone(), q.cap.granted()))
+            .collect();
         // Lapse what has lapsed, on both sides, before carrying anything over.
         for q in self.quotas.values_mut() {
             let gone: Vec<Id> = q
@@ -922,12 +939,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             self.send_releases(op, owed);
         }
         if let Some(op) = self.parent.take() {
-            let owed: Vec<(K, u64)> = self
-                .quotas
-                .iter()
-                .filter(|(_, q)| q.cap.granted() > 0)
-                .map(|(k, q)| (k.clone(), q.cap.granted()))
-                .collect();
             if !owed.is_empty() {
                 self.pending_release = Some((op, owed));
             }
@@ -1186,6 +1197,23 @@ mod tests {
         n
     }
 
+    /// Deliver every queued message among `nodes` (ids 1..) until all are quiet.
+    fn route(nodes: &mut [Lease<u32, &'static str>]) {
+        for _ in 0..16 {
+            let mut moved = false;
+            for i in 0..nodes.len() {
+                let from = nodes[i].me;
+                for Action::Send(to, m) in nodes[i].ready() {
+                    nodes[(to - 1) as usize].on_message(from, m);
+                    moved = true;
+                }
+            }
+            if !moved {
+                break;
+            }
+        }
+    }
+
     /// Deliver every queued message between two nodes until both are quiet.
     fn exchange(a: &mut Lease<u32, &'static str>, b: &mut Lease<u32, &'static str>) {
         for _ in 0..8 {
@@ -1369,6 +1397,42 @@ mod tests {
         p.set_upstream(2);
         p.set_upstream(2);
         assert_eq!(p.parent(), None);
+    }
+
+    #[test]
+    fn a_lapsed_lease_carried_to_a_new_parent_is_fully_released_from_the_old() {
+        let mut ns = vec![node(1), node(2), node(3)];
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        }
+        ns[1].set_upstream(1);
+        ns[2].set_upstream(2);
+        route(&mut ns);
+        let _ = ns[2].acquire(&[(BYTES, 10)]);
+        for _ in 0..3 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns);
+        }
+        assert_eq!(
+            ns[2].stats(&BYTES).unwrap().granted,
+            100,
+            "the chunk came down"
+        );
+        assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 100);
+        // The middle node goes silent; the child's lease lapses, then it moves under the
+        // leader. The adoption is confirmed, and the deferred release reaches the old parent.
+        ns[2].tick(41);
+        ns[2].set_upstream(1);
+        ns[2].set_upstream(1);
+        route(&mut ns);
+        assert_eq!(
+            ns[1].stats(&BYTES).unwrap().lent,
+            0,
+            "the old parent books nothing for it"
+        );
+        assert!(!ns[1].children().any(|&x| x == 3));
     }
 
     #[test]
