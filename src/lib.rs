@@ -247,6 +247,8 @@ struct Quota<Id: Ord + Clone> {
     valid_until: u64,
     /// How much more we want from the parent; asked at the next tick.
     wanted: u64,
+    /// The grant last reported to the parent: a change is reported once more, even to zero.
+    reported: u64,
     last_request: Option<u64>,
     /// Since when we have lent more than we hold.
     over_since: Option<u64>,
@@ -263,6 +265,7 @@ impl<Id: Ord + Clone> Quota<Id> {
             term: 0,
             valid_until: 0,
             wanted: 0,
+            reported: 0,
             last_request: None,
             over_since: None,
         }
@@ -1115,6 +1118,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         for (key, q) in self.quotas.iter_mut() {
             // A limit this node neither holds, lends, wants nor has used is not mentioned.
             let in_play = q.cap.granted() > 0
+                || q.reported > 0
                 || q.lent > 0
                 || q.wanted > 0
                 || (q.limit.kind == LimitKind::Total && q.cap.global_used() > 0);
@@ -1144,6 +1148,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     });
                 }
             }
+            q.reported = q.cap.granted();
             items.push(Item::Renew {
                 key: key.clone(),
                 granted: q.cap.granted(),
@@ -1317,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn a_lease_lapses_without_renewal_and_deny_refuses() {
+    fn a_lease_lapses_without_renewal_and_a_total_refuses() {
         let mut l = node(1);
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
@@ -1427,14 +1432,17 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_share_is_a_token_bucket() {
+    fn a_rate_share_is_a_token_bucket() {
         let mut l = node(1);
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_upstream(1);
         exchange(&mut c, &mut l);
-        assert!(c.acquire(&[(RPS, 1)]).is_err());
+        assert!(
+            c.acquire(&[(RPS, 1)]).is_ok(),
+            "unleased: admitted, and asked"
+        );
         c.tick(1);
         exchange(&mut c, &mut l);
         assert_eq!(c.stats(&RPS).unwrap().granted, 2);
