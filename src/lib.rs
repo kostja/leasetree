@@ -1522,4 +1522,104 @@ mod tests {
         exchange(&mut c, &mut l); // the call goes out at once; the answer carries term 2
         assert!(c.acquire(&[(BYTES, 10)]).is_ok(), "confirmed");
     }
+
+    /// A three-node cluster, leader 1 with children 2 and 3, where 3 has written 60 and
+    /// reported it. Returns the nodes and each node's own durable row.
+    fn cluster_with_writes() -> Vec<Lease<u32, &'static str>> {
+        let mut ns = vec![node(1), node(2), node(3)];
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        }
+        ns[1].set_upstream(1);
+        ns[2].set_upstream(1);
+        route(&mut ns);
+        let _ = ns[1].acquire(&[(BYTES, 40)]);
+        let _ = ns[2].acquire(&[(BYTES, 60)]);
+        for _ in 0..12 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns);
+        }
+        ns[1].acquire(&[(BYTES, 40)]).unwrap();
+        ns[2].acquire(&[(BYTES, 60)]).unwrap();
+        for _ in 0..21 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns);
+        }
+        assert_eq!(ns[0].usage(&BYTES), 100, "the leader has both reports");
+        ns
+    }
+
+    /// What a node would have in its durable table: its own row of the map.
+    fn own_row(n: &Lease<u32, &'static str>) -> (u64, u64) {
+        n.quotas[&BYTES]
+            .cap
+            .delta()
+            .into_iter()
+            .find(|(id, _, _)| *id == n.me)
+            .map_or((0, 0), |(_, a, r)| (a, r))
+    }
+
+    #[test]
+    fn an_expelled_node_s_reported_usage_survives_and_its_unreported_usage_is_lost() {
+        let mut ns = cluster_with_writes();
+        ns[2].acquire(&[(BYTES, 10)]).unwrap(); // written, not yet reported
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2]), 1, 1); // 3 is expelled
+        }
+        for _ in 0..21 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns[..2]);
+        }
+        assert_eq!(
+            ns[0].usage(&BYTES),
+            100,
+            "the reported 60 stays; the unreported 10 is gone"
+        );
+    }
+
+    #[test]
+    #[ignore = "exposes the loss: usage that only lived in memory does not survive a full restart"]
+    fn a_full_restart_after_an_expulsion_keeps_the_expelled_node_s_usage() {
+        let mut ns = cluster_with_writes();
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2]), 1, 1); // 3 is expelled, its table with it
+        }
+        // Every remaining node restarts from its own durable row.
+        let rows: Vec<(u64, u64)> = ns[..2].iter().map(own_row).collect();
+        let mut fresh = vec![
+            Lease::new(1, Config { ttl: 40 }),
+            Lease::new(2, Config { ttl: 40 }),
+        ];
+        for (n, (acquired, released)) in fresh.iter_mut().zip(rows) {
+            n.set_limit(
+                BYTES,
+                Limit::Stock {
+                    limit: 1000,
+                    chunk: 100,
+                    acquired,
+                    released,
+                },
+            );
+            n.set_limit(RPS, rate());
+            n.set_cluster_view(Some(&[1, 2]), 1, 2);
+        }
+        fresh[1].set_upstream(1);
+        for _ in 0..21 {
+            for n in fresh.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut fresh);
+        }
+        assert_eq!(
+            fresh[0].usage(&BYTES),
+            100,
+            "node 3's 60 bytes are still stored; the leader should still count them"
+        );
+    }
 }
