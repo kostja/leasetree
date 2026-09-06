@@ -49,10 +49,36 @@ it receives; a child learns of a new leader from any ancestor's reply.
 
 ### The rules
 
-Each was found by a simulation that went wrong without it.
+Each was found by a simulation that went wrong without it. The first is spelled out below;
+the others are stated in short and explained in the crate docs.
 
-- A lease is dated from the tick its request was *sent*, so a parent that lapses it (dated from
-  arrival, later) never re-lends room the child still considers its own.
+**A lease is dated from the tick its request was sent.** Both ends of a lease keep an expiry.
+The child keeps `valid_until`, past which it stops spending; the parent keeps `expires` on its
+booking, past which it forgets the booking and may lend that room to someone else. The rule
+fixes which clock reading each side uses: the child dates its lease from the tick it *sent*
+the request, the parent dates its booking from the tick the request *arrived*. Arrival is
+never earlier than sending, so the parent's expiry is always at or after the child's. With a
+TTL of 40 and one tick of latency:
+
+| tick | what happens |
+|---|---|
+| 100 | child C sends `Renew` to parent P |
+| 101 | P receives it, books C until 141, replies |
+| 102 | C receives the ack; its lease is good until 140 |
+
+If C never renews again, C stops spending at 140 and P frees the room at 141. The room is
+never spendable by C and lendable by P at the same time. Dating the lease from the ack's
+arrival instead, good until 142, is the version that reads as safe and is not: P frees the
+room at 141, lends it to D, and for two ticks both C and D may write. The overshoot is one
+write per node per tick of latency, plus whatever the clocks disagree by; the simulator found
+it as a handful of bytes, and it grows with both. The rule costs nothing on the wire: the ack
+echoes the request's `sent` tick in `in_reply_to`. Each node compares only its own clock with
+itself, so skew between nodes does not matter; what matters is that a node's clock never steps
+back, see the configuration section. This is the lease discipline of Chubby and GFS: a holder
+dates its lease from the request it sent, not from the reply.
+
+The remaining rules, in short:
+
 - A child reports whenever its bookings, its subtree, its wants or its term changed, and every
   `ttl / 2` as a keepalive. A parent books what the child reports.
 - A parent that cannot fill a request books the child anyway, asks its own parent for the
@@ -160,6 +186,18 @@ With a tick of 100 ms, `ttl: 40` is a four-second lease, renewed every two secon
 whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks. A
 new leader lends again as soon as its reports cover every live member, or after four seconds
 if some member never speaks: a node with nothing in play sends nothing, and is not counted.
+
+## References
+
+- **Leases, and dating them from the request:** Mike Burrows. *The Chubby lock service for
+  loosely-coupled distributed systems.* OSDI 2006. Also Sanjay Ghemawat, Howard Gobioff,
+  Shun-Tak Leung. *The Google File System.* SOSP 2003, section 3.1, on chunk leases.
+- **Escrow and the bounded counter:** Valter Balegas et al. *Extending Eventually Consistent
+  Cloud Databases for Enforcing Numeric Invariants.* IEEE SRDS 2015
+  ([arXiv:1503.09052](https://arxiv.org/abs/1503.09052)); the accounting is the
+  [`bcounter`](https://github.com/kostja/bcounter) crate, whose README has the model.
+- **The overlay:** João Leitão, José Pereira, Luís Rodrigues. *Epidemic Broadcast Trees.*
+  IEEE SRDS 2007; the [`plumtree-fsm`](https://github.com/kostja/plumtree) crate.
 
 ## License
 
