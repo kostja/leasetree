@@ -38,14 +38,44 @@ bound: the step-down time plus one `ttl`, and never more than the cut-off side h
 Most keys never have a limit set; they cost nothing, and a node with nothing in play puts
 nothing on the wire.
 
-### The protocol
+### The protocol: one call
 
-One `Message` per peer carries every limit: the sender's term and leader, its tick, its subtree
-(going up), and the items. Going up: `Request { key, want }`, `Renew { key, granted, usage,
-wanted }`, the keep-alive and report, and `Release { key, amount }`. Going down: `Grant { key,
-amount, renewal, hold }`, where a renewal's `hold` is all the parent books for the child, and
-`Shrink { key, to }`. A stale leader learns of its successor from the term on the first message
-it receives; a child learns of a new leader from any ancestor's reply.
+The whole protocol is one RPC from a child to its parent, `LeaseRequest` answered by
+`LeaseResponse`. The parent never calls the child. Everything the tree needs rides in that
+call, for every limit in play at once:
+
+```rust
+pub struct LeaseRequest<Id, K> {
+    pub term: u64, pub leader: Option<Id>,  // the child's view; a stale parent learns from it
+    pub sent: u64,                          // the child's tick: the lease is dated from it
+    pub members: Vec<Id>,                   // the child's subtree, itself included
+    pub items: Vec<RequestItem<Id, K>>,
+}
+pub struct RequestItem<Id, K> {
+    pub key: K,
+    pub granted: u64,                       // what I hold from you; less than before is a release
+    pub wanted: u64,                        // what more I would take
+    pub usage: Vec<(Id, u64, u64)>,         // stocks only, when there is news: the map under me
+}
+pub struct LeaseResponse<Id, K> {
+    pub term: u64, pub leader: Option<Id>,  // the parent's view; a stale child learns from it
+    pub in_reply_to: u64,                   // the request's `sent`
+    pub items: Vec<ResponseItem<K>>,
+}
+pub struct ResponseItem<K> {
+    pub key: K,
+    pub grant: u64,                         // this much more is yours
+    pub hold: u64,                          // all I book for you; less than you hold is a cut
+    pub pending: bool,                      // I am asking upward for the rest; ask again soon
+}
+```
+
+A child calls every `ttl / 2` as a keepalive, at once when what it holds, wants or covers
+changed or its term did, and every round trip while the parent said `pending`. A release is a
+smaller `granted`; a node that moved tells its old parent `granted: 0`. A cut is a `hold`
+below what the child holds; the child gives back what it has not spent, and what its own
+children hold they learn of in their next answers. Reporting is a stock's business: `usage`
+is empty for a rate, and empty means no news.
 
 ### The rules
 
@@ -79,16 +109,17 @@ dates its lease from the request it sent, not from the reply.
 
 The remaining rules, in short:
 
-- A child reports whenever its bookings, its subtree, its wants or its term changed, and every
+- A child calls whenever what it holds, wants or covers changed, or its term did, and every
   `ttl / 2` as a keepalive. A parent books what the child reports.
 - A parent that cannot fill a request books the child anyway, asks its own parent for the
-  shortfall at once, keeps that much earmarked, and pushes room down the moment it arrives.
+  shortfall at once, keeps that much earmarked, and says so in its answer, so the child asks
+  again after a round trip rather than after the retry period.
 - A node without a good lease asks for one, whatever the kind decides about the write.
-- A node that moves to a new parent owes the old one everything it held before dropping
-  anything, and pays only once the new parent has confirmed the adoption; until then both book
-  it and nobody re-lends it.
+- A node that moves to a new parent tells the old one it holds nothing from it, but only once
+  the new parent has answered; until then both book it and nobody re-lends it.
 - A parent that booked more than it holds cuts a stock only after a grace period, never below
-  what the child's subtree has used, and the child passes the cut down. A rate is never cut.
+  what the child's subtree has used; the child gives back what it can and its own children
+  learn the rest in their next answers. A rate is never cut.
 - A node keeps its parent while that parent keeps delivering the leader's traffic, and never
   takes its own child as parent.
 - A node drops a lease the moment it lapses: the parent has re-lent that room.
@@ -106,11 +137,13 @@ told, and it does not care from where:
 | `set_cluster_view(members, leader, term)` | Raft's system tables | on every change; `members` may be omitted |
 | `set_upstream(peer)` | the overlay | whenever the leader's traffic is delivered, with the peer that delivered it |
 | `down(peers)`, `up(peers)` | the failure detector | on its verdicts |
-| `on_message(from, Message)` | the network | on receipt |
+| `on_request(from, LeaseRequest) -> LeaseResponse` | the RPC handler | on a child's call; returns the answer to send |
+| `on_response(from, LeaseResponse)` | the RPC client | on the parent's answer |
 | `tick(n)` | the timer | every tick |
 
-Every input returns `true` when it took the outbound queue from empty to non-empty: the edge on
-which to wake a sender, which drains `ready()`.
+An input returns `true` when it took the outbound queue from empty to non-empty: the edge on
+which to wake a caller, which drains `ready()` and makes each `Call`. `on_request` returns the
+answer instead; the handler sends it back.
 
 ## Driving it
 
@@ -142,12 +175,17 @@ wake_if(lease.set_upstream(deliverer));
 // The failure detector.
 wake_if(lease.down(&dead)); wake_if(lease.up(&back));
 
-// The network and the timer.
-wake_if(lease.on_message(peer, decode(bytes)));
+// The RPC handler: a child called us.
+fn lease_rpc(req: LeaseRequest) -> LeaseResponse { lease.on_request(caller, req) }
+
+// The timer.
 wake_if(lease.tick(1));
 
-// The sender fibre, woken on the edge.
-for Action::Send(peer, msg) in lease.ready() { pool.send(peer, encode(&msg)).await; }
+// The caller fibre, woken on the edge: make each call, feed the answer back.
+for Action::Call(peer, req) in lease.ready() {
+    let resp = pool.call(peer, "lease", &req).await?;
+    wake_if(lease.on_response(peer, resp));
+}
 
 // The write path, inside the transaction that stores the object: all or none.
 lease.acquire(&[(tenant_bytes, n), (bucket_bytes, n), (user_objects, 1)])?;
@@ -171,8 +209,8 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 | | value |
 |---|---|
 | `ttl` | how long a lease is good without renewal; default 40 |
-| renew | every `ttl / 2` |
-| repeat an unanswered request | after `ttl / 8` |
+| keepalive call | every `ttl / 2` |
+| ask again for what is wanted | after `ttl / 8`, or a round trip while the parent said `pending` |
 | cut a child, once over-committed for | `ttl / 8` |
 | leave a parent | after it missed two deliveries of the leader's traffic |
 | a new leader's fallback window | `ttl` |

@@ -3,7 +3,7 @@
 
 //! A pure state machine for distributed quotas.
 //!
-//! Every node of a cluster holds a lease on each quota it uses. Leases are handed down a
+//! Every node of a cluster holds a lease on each limit it uses. Leases are handed down a
 //! spanning tree rooted at the cluster's leader: the leader holds the whole limit, lends
 //! chunks to its children, and each child lends out of what it holds to its own. Usage is
 //! reported up the same tree as a per-node map, merged at every level, so the leader's total
@@ -26,13 +26,24 @@
 //! runs a token bucket from it. Nothing is reported; a share not renewed lapses. A rate is
 //! about availability: without a good lease a node admits everything and asks for a lease.
 //!
+//! # One call
+//!
+//! The whole protocol is one RPC from a child to its parent: a [`LeaseRequest`] answered by a
+//! [`LeaseResponse`]. The child calls every `ttl / 2`, at once when what it holds, wants or
+//! covers changed, and every round trip while the parent said it was still asking upward. A
+//! request reports, per limit, what the child holds from the parent (less than before is a
+//! release), what more it wants, and, for a stock, the usage map of its subtree. A response
+//! grants, tells the child all the parent books for it (less than it holds is a cut), and
+//! whether the parent is still asking upward on its behalf. The parent never calls the child.
+//!
 //! # The contract
 //!
-//! Every input mutates state and appends to one FIFO outbound queue, drained with
-//! [`ready`](Lease::ready). The inputs that can produce output return `true` when they took
-//! the queue from empty to non-empty: the edge on which to wake a sender. Enforcement,
-//! [`acquire`](Lease::acquire) and [`release`](Lease::release), is local and never sends; a
-//! refusal only marks the quota wanted, and the next [`tick`](Lease::tick) asks the parent.
+//! Every input mutates state; some append to one FIFO outbound queue of calls to make,
+//! drained with [`ready`](Lease::ready), and those return `true` when they took the queue from
+//! empty to non-empty: the edge on which to wake a caller. [`on_request`](Lease::on_request)
+//! returns the response directly, for the RPC handler to send back. Enforcement,
+//! [`acquire`](Lease::acquire) and [`release`](Lease::release), is local and never calls; a
+//! refusal only marks the limit wanted, and the next [`tick`](Lease::tick) asks.
 //!
 //! What the caller supplies:
 //!
@@ -43,7 +54,8 @@
 //! - the upstream peer, from its overlay: [`set_upstream`](Lease::set_upstream) -- whichever
 //!   peer last delivered the leader's traffic;
 //! - liveness, from its failure detector: [`down`](Lease::down) and [`up`](Lease::up);
-//! - the network and the clock: [`on_message`](Lease::on_message) and [`tick`](Lease::tick).
+//! - the network and the clock: [`on_request`](Lease::on_request),
+//!   [`on_response`](Lease::on_response) and [`tick`](Lease::tick).
 //!
 //! # The rules
 //!
@@ -51,16 +63,18 @@
 //!
 //! - A lease is dated from the tick the request was *sent*, so a parent that lapses it
 //!   (dated from arrival, later) never re-lends room the child still considers its own.
-//! - A child reports whenever its bookings, its subtree or its term changed, and every
-//!   `ttl / 2` as a keepalive. A parent books what the child reports.
+//! - A child calls whenever what it holds, wants or covers changed, or its term did, and
+//!   every `ttl / 2` as a keepalive. A parent books what the child reports.
 //! - A parent that cannot fill a request books the child anyway, asks its own parent for the
-//!   shortfall at once, keeps that much earmarked, and pushes room down the moment it arrives.
-//! - A node without a good lease asks for one whatever the policy says about the write.
-//! - A node that moves to a new parent owes the old one everything it held before dropping
-//!   anything, and pays only once the new parent has confirmed the adoption; until then both
-//!   book it and nobody re-lends it.
-//! - Under `Deny`, a parent that booked more than it holds cuts a child only after a grace
-//!   period, never below what the child's subtree has used, and the child passes the cut down.
+//!   shortfall at once, keeps that much earmarked, and says so in its answer, so the child
+//!   asks again after a round trip rather than after the retry period.
+//! - A node without a good lease asks for one whatever the kind decides about the write.
+//! - A node that moves to a new parent reports to the old one that it holds nothing from it,
+//!   but only once the new parent has confirmed the adoption; until then both book it and
+//!   nobody re-lends it.
+//! - A parent that booked more than it holds cuts a stock only after a grace period, never
+//!   below what the child's subtree has used; the child gives back what it can and passes
+//!   the rest on to its own children in their next answers. A rate is never cut.
 //! - A node keeps its parent while that parent keeps delivering the leader's traffic, and
 //!   never takes its own child as parent.
 //! - A node drops a lease the moment it lapses: the parent has re-lent that room.
@@ -135,87 +149,75 @@ impl Limit {
     }
 }
 
-/// One item of a [`Message`].
+/// One limit in a [`LeaseRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Item<Id, K> {
-    /// child -> parent: lend me up to `want` more.
-    Request {
-        /// The quota.
-        key: K,
-        /// How much more.
-        want: u64,
-    },
-    /// child -> parent: keep-alive and report. The child's whole grant, so a new parent can
-    /// adopt it, and the usage map of its subtree (stocks only).
-    Renew {
-        /// The quota.
-        key: K,
-        /// All the child holds.
-        granted: u64,
-        /// `(node, acquired, released)` for every node under it, itself included.
-        usage: Vec<(Id, u64, u64)>,
-        /// What the child still wants; the parent keeps that much earmarked for it.
-        wanted: u64,
-    },
-    /// child -> parent: I no longer hold `amount` of what you lent me.
-    Release {
-        /// The quota.
-        key: K,
-        /// How much.
-        amount: u64,
-    },
-    /// parent -> child: `amount` more is yours. As the answer to a `Renew` (`renewal`), `hold`
-    /// is all the parent books for you: less than you hold is a cut, and it confirms an
-    /// adoption. The answer to a `Request` says nothing about the booking as a whole.
-    Grant {
-        /// The quota.
-        key: K,
-        /// How much more.
-        amount: u64,
-        /// Whether this answers a `Renew`.
-        renewal: bool,
-        /// All the parent books for the child (renewals only; `u64::MAX` otherwise).
-        hold: u64,
-    },
-    /// parent -> child: your grant is now `to`. Unsolicited; the next renewal's `hold` says
-    /// the same, so a lost one heals.
-    Shrink {
-        /// The quota.
-        key: K,
-        /// The new grant.
-        to: u64,
-    },
+pub struct RequestItem<Id, K> {
+    /// The limit.
+    pub key: K,
+    /// What the child holds from the parent. Less than before is a release; zero to an old
+    /// parent lets it go entirely.
+    pub granted: u64,
+    /// What more the child would take.
+    pub wanted: u64,
+    /// Stocks only, when there is news: `(node, acquired, released)` for every node under the
+    /// child, itself included. Empty means no change.
+    pub usage: Vec<(Id, u64, u64)>,
 }
 
-/// Everything one node has for one peer, in one go.
+/// child -> parent: the one call. A report and a request in one, for every limit in play.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Message<Id, K> {
-    /// The sender's term.
+pub struct LeaseRequest<Id, K> {
+    /// The child's term.
     pub term: u64,
-    /// The sender's leader. A stale leader learns of its successor from the first message
-    /// it receives.
+    /// The child's leader.
     pub leader: Option<Id>,
-    /// The sender's tick. A lease is dated from the tick its request was sent.
+    /// The child's tick. A lease is dated from it.
     pub sent: u64,
-    /// When answering: the `sent` of the message answered.
-    pub in_reply_to: Option<u64>,
-    /// The sender's subtree, itself included (going up only).
+    /// The child's subtree, itself included.
     pub members: Vec<Id>,
-    /// The items.
-    pub items: Vec<Item<Id, K>>,
+    /// The limits.
+    pub items: Vec<RequestItem<Id, K>>,
+}
+
+/// One limit in a [`LeaseResponse`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseItem<K> {
+    /// The limit.
+    pub key: K,
+    /// This much more is the child's.
+    pub grant: u64,
+    /// All the parent books for the child. Less than the child holds is a cut.
+    pub hold: u64,
+    /// The parent could not fill the request and is asking upward: ask again after a round
+    /// trip, not after the retry period.
+    pub pending: bool,
+}
+
+/// parent -> child: the answer. A stale leader learns of its successor from `term` on the
+/// first answer it gets; so does a child from any ancestor's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseResponse<Id, K> {
+    /// The parent's term.
+    pub term: u64,
+    /// The parent's leader.
+    pub leader: Option<Id>,
+    /// The `sent` of the request answered.
+    pub in_reply_to: u64,
+    /// The limits, in the request's order.
+    pub items: Vec<ResponseItem<K>>,
 }
 
 /// Something the caller must do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action<Id, K> {
-    /// Send this message to this peer.
-    Send(Id, Message<Id, K>),
+    /// Call this peer, and feed its answer to [`on_response`](Lease::on_response).
+    Call(Id, LeaseRequest<Id, K>),
 }
 
 /// An `acquire` that could not be honoured.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Denied<K> {
-    /// The first quota that refused.
+    /// The first limit that refused.
     pub key: K,
     /// What it could have given.
     pub available: u64,
@@ -244,7 +246,7 @@ pub struct Stats {
     pub valid_until: u64,
 }
 
-/// What a parent books for one child on one quota.
+/// What a parent books for one child on one limit.
 #[derive(Clone, Debug)]
 struct Booking {
     granted: u64,
@@ -258,12 +260,12 @@ struct Booking {
     wanted: u64,
 }
 
-/// One quota's state on this node.
+/// One limit's state on this node.
 struct Quota<Id: Ord + Clone> {
     limit: Limit,
     /// The grant and, for a stock, the usage map: our own slot and the children's, merged.
     cap: BCounter<Id>,
-    /// A flow's bucket.
+    /// A rate's bucket.
     tokens: f64,
     lent: u64,
     children: BTreeMap<Id, Booking>,
@@ -272,9 +274,14 @@ struct Quota<Id: Ord + Clone> {
     valid_until: u64,
     /// How much more we want from the parent; asked at the next tick.
     wanted: u64,
-    /// The grant last reported to the parent: a change is reported once more, even to zero.
+    /// The grant last reported to the parent, or given by it: a change is reported once
+    /// more, even to zero.
     reported: u64,
     last_request: Option<u64>,
+    /// Our parent said it is asking upward for us: ask again after a round trip.
+    pending: bool,
+    /// We are asking upward for a child and have not been refused: say so to the children.
+    asking: bool,
     /// Since when we have lent more than we hold.
     over_since: Option<u64>,
 }
@@ -292,10 +299,12 @@ impl<Id: Ord + Clone> Quota<Id> {
             wanted: 0,
             reported: 0,
             last_request: None,
+            pending: false,
+            asking: false,
             over_since: None,
         }
     }
-    /// What we hold and have not used (stocks) or hold (flows).
+    /// What we hold and have not used (stocks) or hold (rates).
     fn available(&self) -> u64 {
         self.cap.local_available()
     }
@@ -313,6 +322,16 @@ impl<Id: Ord + Clone> Quota<Id> {
     fn earmarked(&self) -> u64 {
         self.children.values().map(|b| b.wanted).sum()
     }
+    /// The parent books less than we hold: give the difference back, what is unspent of it.
+    /// What we cannot give back our children hold; they get it in their next answers.
+    fn cut_to(&mut self, hold: u64) -> bool {
+        let cut = self.cap.granted().saturating_sub(hold);
+        if cut == 0 {
+            return false;
+        }
+        let _ = self.cap.reclaim(cut);
+        true
+    }
 }
 
 /// A tree link to a child: what it last reported about its subtree.
@@ -321,7 +340,7 @@ struct Link<Id> {
     expires: u64,
 }
 
-/// One node's lease state, for every quota.
+/// One node's lease state, for every limit.
 pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     me: Id,
     cfg: Config,
@@ -336,12 +355,12 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     leader_since: u64,
     links: BTreeMap<Id, Link<Id>>,
     quotas: BTreeMap<K, Quota<Id>>,
-    /// After a parent change: the old parent and what we held from it, released once the new
+    /// After a parent change: the old parent, told that we hold nothing from it once the new
     /// parent has confirmed the adoption.
-    pending_release: Option<(Id, Vec<(K, u64)>)>,
-    /// Bookings changed since the last report: report at the next tick.
+    owed: Option<(Id, Vec<K>)>,
+    /// Something changed since the last call: call at the next tick.
     dirty: bool,
-    last_renew: u64,
+    last_call: u64,
     outbound: Vec<Action<Id, K>>,
 }
 
@@ -361,9 +380,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             leader_since: 0,
             links: BTreeMap::new(),
             quotas: BTreeMap::new(),
-            pending_release: None,
+            owed: None,
             dirty: false,
-            last_renew: 0,
+            last_call: 0,
             outbound: Vec::new(),
         }
     }
@@ -393,14 +412,15 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
-    /// Forget a limit: hand back to the parent whatever was held, and drop the key entirely.
+    /// Forget a limit: tell the parent we hold nothing of it, and drop the key entirely.
     /// Children holding it lapse; their own configuration drops it too.
     pub fn remove_limit(&mut self, key: &K) -> bool {
         let was_empty = self.outbound.is_empty();
         if let Some(q) = self.quotas.remove(key) {
             if let Some(p) = self.parent.clone() {
-                if q.cap.granted() > 0 {
-                    self.send_releases(p, vec![(key.clone(), q.cap.granted())]);
+                if q.cap.granted() > 0 || q.reported > 0 {
+                    let req = self.request_for(std::slice::from_ref(key));
+                    self.outbound.push(Action::Call(p, req));
                 }
             }
         }
@@ -446,7 +466,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             } else if leader != self.me && was_leader {
                 self.demote();
             }
-            // A new term: report now, so the ack confirms the lease in it.
+            // A new term: call now, so the answer confirms the lease in it.
             self.dirty = true;
         }
         self.woke(was_empty)
@@ -501,213 +521,177 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     // ------------------------------------------------------------ the protocol
 
-    /// A message from `from`.
-    pub fn on_message(&mut self, from: Id, msg: Message<Id, K>) -> bool {
-        let was_empty = self.outbound.is_empty();
-        if msg.term > self.term {
-            if let Some(l) = msg.leader.clone() {
-                self.set_cluster_view(None, l, msg.term);
+    /// A call from a child. Returns the answer, for the RPC handler to send back.
+    pub fn on_request(&mut self, from: Id, req: LeaseRequest<Id, K>) -> LeaseResponse<Id, K> {
+        if req.term > self.term {
+            if let Some(l) = req.leader.clone() {
+                self.set_cluster_view(None, l, req.term);
             }
         }
-        let from_parent = self.parent.as_ref() == Some(&from);
         let ttl = self.cfg.ttl;
         let now = self.now;
-        let mut reply: Vec<Item<Id, K>> = Vec::new();
-        let mut cuts: Vec<(Id, K, u64)> = Vec::new();
-        let mut pushes: Vec<(Id, K, u64)> = Vec::new();
-        let mut confirmed = false;
-        for item in msg.items {
-            match item {
-                Item::Request { key, want } => {
-                    if self.is_leader() && !self.may_grant() {
-                        continue;
-                    }
-                    let Some(q) = self.quotas.get_mut(&key) else {
-                        continue;
-                    };
-                    let give = want.min(q.room());
-                    // Book the child even for nothing: its want is remembered there, and
-                    // room arriving later is pushed to it.
-                    let b = q.children.entry(from.clone()).or_insert(Booking {
-                        granted: 0,
-                        used: 0,
-                        expires: now + ttl,
-                        given_at: now,
-                        wanted: 0,
-                    });
-                    if give > 0 {
-                        b.granted += give;
-                        b.given_at = now;
-                        q.lent += give;
-                    }
-                    b.expires = now + ttl;
-                    let short = want - give;
-                    b.wanted = short;
-                    if short > 0 {
-                        // New demand from below: ask upward at the next tick, not after the
-                        // retry period.
-                        q.wanted = q.wanted.max(short);
-                        q.last_request = None;
-                    }
-                    reply.push(Item::Grant {
-                        key,
-                        amount: give,
-                        renewal: false,
-                        hold: u64::MAX,
-                    });
+        let grace = Self::grace(ttl);
+        // The link: what the child covers.
+        let members: BTreeSet<Id> = req.members.iter().cloned().collect();
+        let link = self.links.entry(from.clone()).or_insert(Link {
+            members: BTreeSet::new(),
+            expires: 0,
+        });
+        if link.members != members {
+            // Our subtree changed: report it up at once, so a new leader's coverage does not
+            // wait for the periodic call.
+            self.dirty = true;
+        }
+        link.members = members;
+        link.expires = now + ttl;
+        // With the link in place: is a new leader still waiting to hear from everyone?
+        let settling = self.is_leader() && !self.may_grant();
+        let can_ask = self.parent.is_some();
+
+        let mut items = Vec::with_capacity(req.items.len());
+        for it in req.items {
+            let Some(q) = self.quotas.get_mut(&it.key) else {
+                continue;
+            };
+            let used: u64 = it.usage.iter().map(|(_, a, r)| a.saturating_sub(*r)).sum();
+            if q.limit.is_stock() && !it.usage.is_empty() {
+                q.cap.apply(&it.usage);
+            }
+            // Book what the child reports. A report sent before our last gift reached the
+            // child does not include it: keep the booking.
+            let (old, given_at) = q
+                .children
+                .get(&from)
+                .map_or((0, 0), |b| (b.granted, b.given_at));
+            let booked = if req.sent > given_at {
+                it.granted
+            } else {
+                old.max(it.granted)
+            };
+            if old != booked {
+                self.dirty = true;
+            }
+            q.lent = q.lent - old + booked;
+            // Give what we can of what is wanted; earmark and ask upward for the rest.
+            let give = if settling {
+                0
+            } else {
+                it.wanted.min(q.available().saturating_sub(q.lent))
+            };
+            q.lent += give;
+            let short = it.wanted - give;
+            if short > 0 && !settling && can_ask {
+                if q.wanted == 0 {
+                    q.last_request = None;
                 }
-                Item::Renew {
-                    key,
-                    granted,
-                    usage,
-                    wanted,
-                } => {
-                    let link = self.links.entry(from.clone()).or_insert(Link {
-                        members: BTreeSet::new(),
-                        expires: 0,
-                    });
-                    let members: BTreeSet<Id> = msg.members.iter().cloned().collect();
-                    if link.members != members {
-                        // Our subtree changed: report it up at once, so a new leader's
-                        // coverage does not wait for the periodic renewal.
-                        self.dirty = true;
-                    }
-                    link.members = members;
-                    link.expires = now + ttl;
-                    let settling = self.is_leader() && !self.may_grant();
-                    let Some(q) = self.quotas.get_mut(&key) else {
-                        continue;
-                    };
-                    let used: u64 = usage.iter().map(|(_, a, r)| a.saturating_sub(*r)).sum();
-                    if q.limit.is_stock() {
-                        q.cap.apply(&usage);
-                    }
-                    let b = q.children.entry(from.clone()).or_insert(Booking {
-                        granted: 0,
-                        used: 0,
-                        expires: 0,
-                        given_at: 0,
-                        wanted: 0,
-                    });
-                    // A report sent before our last gift reached the child does not include
-                    // it: keep the booking.
-                    let booked = if msg.sent > b.given_at {
-                        granted
-                    } else {
-                        b.granted.max(granted)
-                    };
-                    if b.granted != booked {
-                        self.dirty = true;
-                    }
-                    q.lent = q.lent - b.granted + booked;
-                    b.granted = booked;
-                    b.used = used;
-                    b.wanted = wanted;
-                    b.expires = now + ttl;
-                    let grace = Self::grace(ttl);
-                    let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
-                    let cuts_apply = q.limit.is_stock();
-                    let hold = if !cuts_apply || settling || !long_enough {
-                        booked
-                    } else {
-                        booked - q.overcommit().min(booked.saturating_sub(used))
-                    };
-                    reply.push(Item::Grant {
-                        key,
-                        amount: 0,
-                        renewal: true,
-                        hold,
-                    });
-                }
-                Item::Release { key, amount } => {
-                    if let Some(q) = self.quotas.get_mut(&key) {
-                        if let Some(b) = q.children.get_mut(&from) {
-                            let back = amount.min(b.granted);
-                            b.granted -= back;
-                            q.lent -= back;
-                            if b.granted == 0 {
-                                q.children.remove(&from);
-                            }
-                            self.dirty = true;
-                        }
-                    }
-                    let still_child = self.quotas.values().any(|q| {
-                        q.children
-                            .get(&from)
-                            .is_some_and(|b| b.granted > 0 || b.wanted > 0)
-                    });
-                    if !still_child {
-                        self.links.remove(&from);
-                    }
-                }
-                Item::Grant {
-                    key,
-                    amount,
-                    renewal,
-                    hold,
-                } => {
-                    if !from_parent {
-                        continue;
-                    }
-                    let Some(q) = self.quotas.get_mut(&key) else {
-                        continue;
-                    };
-                    q.cap.grant(amount);
-                    if amount > 0 {
-                        // What the parent gave, it books: as good as reported.
-                        q.reported += amount;
-                        q.wanted = q.wanted.saturating_sub(amount);
-                        // Room arrived: hand it straight to the children waiting for it,
-                        // rather than making them ask again.
-                        for (c, give) in Self::serve_waiting(q, now, ttl) {
-                            pushes.push((c, key.clone(), give));
-                        }
-                    }
-                    q.term = q.term.max(msg.term);
-                    let dated = msg.in_reply_to.unwrap_or(msg.sent);
-                    q.valid_until = q.valid_until.max(dated + ttl);
-                    if renewal {
-                        confirmed = true;
-                        cuts.extend(Self::cut(&from, q, key, hold));
-                    }
-                }
-                Item::Shrink { key, to } => {
-                    if !from_parent {
-                        continue;
-                    }
-                    if let Some(q) = self.quotas.get_mut(&key) {
-                        cuts.extend(Self::cut(&from, q, key, to));
-                    }
-                }
+                q.wanted = q.wanted.max(short);
+                q.asking = true;
+            }
+            let pending = short > 0 && q.asking;
+            let overcommit = q.overcommit();
+            let is_stock = q.limit.is_stock();
+            let b = q.children.entry(from.clone()).or_insert(Booking {
+                granted: 0,
+                used: 0,
+                expires: 0,
+                given_at: 0,
+                wanted: 0,
+            });
+            b.granted = booked + give;
+            if give > 0 {
+                b.given_at = now;
+            }
+            if !it.usage.is_empty() {
+                b.used = used;
+            }
+            b.expires = now + ttl;
+            b.wanted = short;
+            // Under a stock, what we booked beyond our own lease has to come back: the answer
+            // tells the child to keep less, down to what its subtree used. Not while a new
+            // leader is settling, and not before a round trip: a moving lease is booked by
+            // both parents for that long, on purpose.
+            let long_enough = q.over_since.is_some_and(|s| now >= s + grace);
+            let hold = if !is_stock || settling || !long_enough {
+                b.granted
+            } else {
+                b.granted - overcommit.min(b.granted.saturating_sub(b.used))
+            };
+            items.push(ResponseItem {
+                key: it.key,
+                grant: give,
+                hold,
+                pending,
+            });
+        }
+        // A child that holds nothing and wants nothing of any limit is no longer a child.
+        let still = self.quotas.values().any(|q| {
+            q.children
+                .get(&from)
+                .is_some_and(|b| b.granted > 0 || b.wanted > 0)
+        });
+        if !still {
+            self.links.remove(&from);
+            for q in self.quotas.values_mut() {
+                q.children.remove(&from);
             }
         }
-        if !cuts.is_empty() {
-            self.dirty = true;
-            self.send_shrinks(cuts);
+        LeaseResponse {
+            term: self.term,
+            leader: self.leader.clone(),
+            in_reply_to: req.sent,
+            items,
         }
-        if !pushes.is_empty() {
-            self.send_grants(pushes);
+    }
+
+    /// The answer to a call. Answers from anyone but the current parent only carry news of
+    /// the term.
+    pub fn on_response(&mut self, from: Id, resp: LeaseResponse<Id, K>) -> bool {
+        let was_empty = self.outbound.is_empty();
+        if resp.term > self.term {
+            if let Some(l) = resp.leader.clone() {
+                self.set_cluster_view(None, l, resp.term);
+            }
         }
-        if confirmed {
-            self.release_old_parent();
+        if self.parent.as_ref() != Some(&from) {
+            return self.woke(was_empty);
         }
-        if !reply.is_empty() {
-            let m = self.envelope(Some(msg.sent), false, reply);
-            self.outbound.push(Action::Send(from, m));
+        let ttl = self.cfg.ttl;
+        for it in resp.items {
+            let Some(q) = self.quotas.get_mut(&it.key) else {
+                continue;
+            };
+            q.cap.grant(it.grant);
+            if it.grant > 0 {
+                q.reported += it.grant;
+                q.wanted = q.wanted.saturating_sub(it.grant);
+            }
+            q.term = q.term.max(resp.term);
+            q.valid_until = q.valid_until.max(resp.in_reply_to + ttl);
+            q.pending = it.pending;
+            if !it.pending && it.grant == 0 {
+                // Refused outright: our children hear that in their next answers.
+                q.asking = false;
+            }
+            if q.cut_to(it.hold) {
+                self.dirty = true;
+            }
+        }
+        // The parent has booked us: the old parent may let go.
+        if let Some((op, keys)) = self.owed.take() {
+            let req = self.request_for(&keys);
+            self.outbound.push(Action::Call(op, req));
         }
         self.woke(was_empty)
     }
 
-    /// Advance the clock by `n` ticks: refill flows, lapse children, drop lapsed leases,
-    /// report, and ask.
+    /// Advance the clock by `n` ticks: refill rates, lapse children, drop lapsed leases, and
+    /// call the parent when it is time.
     pub fn tick(&mut self, n: u64) -> bool {
         let was_empty = self.outbound.is_empty();
         self.now = self.now.saturating_add(n);
         let now = self.now;
-        let ttl = self.cfg.ttl;
         let leader = self.is_leader();
 
-        // Flows refill; children lapse; over-commit is timed.
         for q in self.quotas.values_mut() {
             if !q.limit.is_stock() {
                 let refill = q.refill();
@@ -742,15 +726,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
         if !leader {
             self.drop_lapsed();
-        }
-
-        // Report and ask.
-        if !leader && self.parent.is_some() {
-            let due = now >= self.last_renew + ttl / 2;
-            if self.dirty || due {
-                self.renew();
-            } else {
-                self.ask();
+            if self.parent.is_some() && self.call_due() {
+                self.call();
             }
         }
         self.woke(was_empty)
@@ -770,9 +747,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     // ------------------------------------------------------------ enforcement
 
-    /// Draw `amount` on each quota, all or none. A quota not configured is unlimited. A stock
-    /// draws on the held lease; a flow draws tokens. Without a good lease, `Allow` writes
-    /// anyway and `Deny` refuses. A refusal marks the quota wanted; the next tick asks.
+    /// Draw `amount` on each limit, all or none. A limit not configured is unlimited. A stock
+    /// draws on the held lease and refuses without a good one; a rate draws tokens and admits
+    /// without a good one. A refusal, or a missing lease, marks the limit wanted; the next
+    /// tick asks.
     pub fn acquire(&mut self, keys: &[(K, u64)]) -> Result<(), Denied<K>> {
         let leader = self.is_leader();
         let (term, now) = (self.term, self.now);
@@ -858,7 +836,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.quotas.get(key).map_or(0, |q| q.cap.global_used())
     }
 
-    /// A quota's figures, for metrics.
+    /// A limit's figures, for metrics.
     pub fn stats(&self, key: &K) -> Option<Stats> {
         let q = self.quotas.get(key)?;
         Some(Stats {
@@ -897,30 +875,34 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         q.term = term;
         q.valid_until = u64::MAX;
         q.wanted = 0;
+        q.pending = false;
+        q.asking = false;
     }
 
     /// Become the leader: hold every limit outright, and let the old parent go.
     fn crown(&mut self) {
         let term = self.term;
         self.leader_since = self.now;
-        let owed: Vec<(K, u64)> = self
+        let keys: Vec<K> = self
             .quotas
             .iter()
-            .filter(|(_, q)| q.cap.granted() > 0)
-            .map(|(k, q)| (k.clone(), q.cap.granted()))
+            .filter(|(_, q)| q.cap.granted() > 0 || q.reported > 0)
+            .map(|(k, _)| k.clone())
             .collect();
-        if let Some(op) = self.parent.take() {
-            if !owed.is_empty() {
-                self.send_releases(op, owed);
-            }
-        }
-        if let Some((op, owed)) = self.pending_release.take() {
-            self.send_releases(op, owed);
-        }
-        self.parent_misses = 0;
         for q in self.quotas.values_mut() {
             Self::hold_limit(q, term);
         }
+        if let Some(op) = self.parent.take() {
+            if !keys.is_empty() {
+                let req = self.request_for(&keys);
+                self.outbound.push(Action::Call(op, req));
+            }
+        }
+        if let Some((op, keys)) = self.owed.take() {
+            let req = self.request_for(&keys);
+            self.outbound.push(Action::Call(op, req));
+        }
+        self.parent_misses = 0;
     }
 
     /// Stop being the leader: keep what is used or lent, drop the rest of the root grant.
@@ -929,6 +911,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let excess = q.room();
             let _ = q.cap.reclaim(excess);
             q.valid_until = 0;
+            q.reported = 0;
         }
         self.parent = None;
         self.parent_misses = 0;
@@ -945,7 +928,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     /// A lapsed lease has been re-lent by the parent: drop what is not spent or lent, so the
-    /// next report does not claim it and the next ack cannot revive it.
+    /// next report does not claim it and the next answer cannot revive it.
     fn drop_lapsed(&mut self) {
         let now = self.now;
         for q in self.quotas.values_mut() {
@@ -960,15 +943,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     fn reparent(&mut self, peer: Id) {
         let now = self.now;
-        // What the old parent books for us is what we held before dropping anything: owe it
-        // all of that, or the dropped part stays booked there until it lapses.
-        let owed: Vec<(K, u64)> = self
+        // The old parent books what we held before dropping anything: it is told we hold
+        // nothing from it, once the new parent has confirmed us.
+        let keys: Vec<K> = self
             .quotas
             .iter()
-            .filter(|(_, q)| q.cap.granted() > 0)
-            .map(|(k, q)| (k.clone(), q.cap.granted()))
+            .filter(|(_, q)| q.cap.granted() > 0 || q.reported > 0)
+            .map(|(k, _)| k.clone())
             .collect();
-        // Lapse what has lapsed, on both sides, before carrying anything over.
         for q in self.quotas.values_mut() {
             let gone: Vec<Id> = q
                 .children
@@ -985,111 +967,42 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.drop_lapsed();
         // A release still owed to an even older parent goes out now; this one waits for the
         // new parent's confirmation.
-        if let Some((op, owed)) = self.pending_release.take() {
-            self.send_releases(op, owed);
+        if let Some((op, keys)) = self.owed.take() {
+            let req = self.request_for(&keys);
+            self.outbound.push(Action::Call(op, req));
         }
         if let Some(op) = self.parent.take() {
-            if !owed.is_empty() {
-                self.pending_release = Some((op, owed));
+            if !keys.is_empty() {
+                self.owed = Some((op, keys));
             }
         }
         self.parent = Some(peer);
         self.parent_misses = 0;
-        self.renew();
+        for q in self.quotas.values_mut() {
+            // The new parent has given us nothing yet; what we hold is all news to it.
+            q.reported = 0;
+            q.pending = false;
+        }
+        self.call();
     }
 
-    fn release_old_parent(&mut self) {
-        if let Some((op, owed)) = self.pending_release.take() {
-            self.send_releases(op, owed);
-        }
-    }
-
-    fn send_releases(&mut self, to: Id, owed: Vec<(K, u64)>) {
-        let items = owed
-            .into_iter()
-            .map(|(key, amount)| Item::Release { key, amount })
-            .collect();
-        let m = self.envelope(None, false, items);
-        self.outbound.push(Action::Send(to, m));
-    }
-
-    /// The parent books less than we hold: give the difference back, what is unspent of it,
-    /// and pass on to our children what we could not.
-    fn cut(from: &Id, q: &mut Quota<Id>, key: K, hold: u64) -> Vec<(Id, K, u64)> {
-        let _ = from;
-        let cut = q.cap.granted().saturating_sub(hold);
-        if cut == 0 {
-            return Vec::new();
-        }
-        let _ = q.cap.reclaim(cut);
-        let mut over = q.overcommit();
-        let mut asks = Vec::new();
-        for (c, b) in &q.children {
-            if over == 0 {
-                break;
-            }
-            let take = over.min(b.granted.saturating_sub(b.used));
-            if take > 0 {
-                over -= take;
-                asks.push((c.clone(), key.clone(), b.granted - take));
-            }
-        }
-        asks
-    }
-
-    /// Give waiting children what they asked for, as far as room allows. Returns the gifts.
-    fn serve_waiting(q: &mut Quota<Id>, now: u64, ttl: u64) -> Vec<(Id, u64)> {
-        let mut gifts = Vec::new();
-        let waiting: Vec<Id> = q
-            .children
-            .iter()
-            .filter(|(_, b)| b.wanted > 0)
-            .map(|(c, _)| c.clone())
-            .collect();
-        for c in waiting {
-            let room = q.room();
-            if room == 0 {
-                break;
-            }
-            let b = q.children.get_mut(&c).expect("listed");
-            let give = b.wanted.min(room);
-            b.granted += give;
-            b.wanted -= give;
-            b.expires = now + ttl;
-            b.given_at = now;
-            q.lent += give;
-            gifts.push((c, give));
-        }
-        gifts
-    }
-
-    fn send_grants(&mut self, gifts: Vec<(Id, K, u64)>) {
-        let mut per_child: BTreeMap<Id, Vec<Item<Id, K>>> = BTreeMap::new();
-        for (c, key, amount) in gifts {
-            per_child.entry(c).or_default().push(Item::Grant {
-                key,
-                amount,
-                renewal: false,
-                hold: u64::MAX,
-            });
-        }
-        for (c, items) in per_child {
-            let m = self.envelope(None, false, items);
-            self.outbound.push(Action::Send(c, m));
-        }
-    }
-
-    fn send_shrinks(&mut self, cuts: Vec<(Id, K, u64)>) {
-        let mut per_child: BTreeMap<Id, Vec<Item<Id, K>>> = BTreeMap::new();
-        for (c, key, to) in cuts {
-            per_child
-                .entry(c)
-                .or_default()
-                .push(Item::Shrink { key, to });
-        }
-        for (c, items) in per_child {
-            let m = self.envelope(None, false, items);
-            self.outbound.push(Action::Send(c, m));
+    /// A call that tells `to` we hold nothing from it: to an old parent, or for a removed
+    /// limit.
+    fn request_for(&self, keys: &[K]) -> LeaseRequest<Id, K> {
+        LeaseRequest {
+            term: self.term,
+            leader: self.leader.clone(),
+            sent: self.now,
+            members: Vec::new(),
+            items: keys
+                .iter()
+                .map(|k| RequestItem {
+                    key: k.clone(),
+                    granted: 0,
+                    wanted: 0,
+                    usage: Vec::new(),
+                })
+                .collect(),
         }
     }
 
@@ -1116,34 +1029,35 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             .all(|m| covered.contains(m))
     }
 
-    fn envelope(
-        &self,
-        in_reply_to: Option<u64>,
-        up: bool,
-        items: Vec<Item<Id, K>>,
-    ) -> Message<Id, K> {
-        Message {
-            term: self.term,
-            leader: self.leader.clone(),
-            sent: self.now,
-            in_reply_to,
-            members: if up { self.subtree() } else { Vec::new() },
-            items,
+    /// Whether it is time to call the parent: something changed, the keepalive is due, or
+    /// something is wanted and the retry has run out (a round trip while the parent is asking
+    /// upward for us, `ttl / 8` otherwise).
+    fn call_due(&self) -> bool {
+        let now = self.now;
+        if self.dirty || now >= self.last_call + self.cfg.ttl / 2 {
+            return true;
         }
+        let retry = Self::grace(self.cfg.ttl);
+        self.quotas.values().any(|q| {
+            let want = q.wanted.max(q.overcommit());
+            let wait = if q.pending { 2 } else { retry };
+            want > 0 && q.last_request.map_or(true, |t| now >= t + wait)
+        })
     }
 
-    /// Report to the parent: every quota's grant and usage, capacity we will not use, and
-    /// whatever we want.
-    fn renew(&mut self) {
+    /// Call the parent: every limit in play, what we hold, what we want, and, for a stock,
+    /// the usage map under us, plus what we can hand back. Nothing in play: nothing on the
+    /// wire.
+    fn call(&mut self) {
         let Some(parent) = self.parent.clone() else {
             return;
         };
         let now = self.now;
+        let full = self.dirty || now >= self.last_call + self.cfg.ttl / 2;
         self.dirty = false;
-        self.last_renew = now;
+        self.last_call = now;
         let mut items = Vec::new();
         for (key, q) in self.quotas.iter_mut() {
-            // A limit this node neither holds, lends, wants nor has used is not mentioned.
             let in_play = q.cap.granted() > 0
                 || q.reported > 0
                 || q.lent > 0
@@ -1153,7 +1067,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 continue;
             }
             // Hand back room beyond two chunks (a stock), or a share beyond what is lent plus
-            // one chunk while the bucket is full (a rate).
+            // one chunk while the bucket is full (a rate); never what a child is waiting for.
             let keep = match q.limit {
                 Limit::Stock { .. } => 2 * q.limit.chunk(),
                 Limit::Rate { .. } => {
@@ -1167,65 +1081,36 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             .saturating_add(q.earmarked());
             let spare = q.room();
             if spare > keep {
-                let back = q.cap.reclaim(spare - keep);
-                if back > 0 {
-                    items.push(Item::Release {
-                        key: key.clone(),
-                        amount: back,
-                    });
-                }
+                let _ = q.cap.reclaim(spare - keep);
+            }
+            let want = q.wanted.max(q.overcommit());
+            if want > 0 {
+                q.last_request = Some(now);
+                q.asking = true;
             }
             q.reported = q.cap.granted();
-            items.push(Item::Renew {
+            items.push(RequestItem {
                 key: key.clone(),
                 granted: q.cap.granted(),
-                usage: if q.limit.is_stock() {
+                wanted: want,
+                usage: if full && q.limit.is_stock() {
                     q.cap.delta()
                 } else {
                     Vec::new()
                 },
-                wanted: q.wanted.max(q.overcommit()),
             });
         }
-        items.extend(self.requests());
-        // Nothing in play: nothing on the wire. Most keys never have a limit set.
         if items.is_empty() {
             return;
         }
-        let m = self.envelope(None, true, items);
-        self.outbound.push(Action::Send(parent, m));
-    }
-
-    /// Ask the parent for what is wanted, if anything is due.
-    fn ask(&mut self) {
-        let Some(parent) = self.parent.clone() else {
-            return;
+        let req = LeaseRequest {
+            term: self.term,
+            leader: self.leader.clone(),
+            sent: now,
+            members: self.subtree(),
+            items,
         };
-        let items = self.requests();
-        if items.is_empty() {
-            return;
-        }
-        let m = self.envelope(None, true, items);
-        self.outbound.push(Action::Send(parent, m));
-    }
-
-    fn requests(&mut self) -> Vec<Item<Id, K>> {
-        let now = self.now;
-        let retry = Self::grace(self.cfg.ttl);
-        let mut items = Vec::new();
-        for (key, q) in self.quotas.iter_mut() {
-            let want = q.wanted.max(q.overcommit());
-            let recent = q.last_request.is_some_and(|t| now < t + retry);
-            if want == 0 || recent {
-                continue;
-            }
-            q.last_request = Some(now);
-            items.push(Item::Request {
-                key: key.clone(),
-                want,
-            });
-        }
-        items
+        self.outbound.push(Action::Call(parent, req));
     }
 }
 
@@ -1259,14 +1144,15 @@ mod tests {
         n
     }
 
-    /// Deliver every queued message among `nodes` (ids 1..) until all are quiet.
+    /// Make every queued call among `nodes` (ids 1..) and feed back the answers, until quiet.
     fn route(nodes: &mut [Lease<u32, &'static str>]) {
         for _ in 0..16 {
             let mut moved = false;
             for i in 0..nodes.len() {
                 let from = nodes[i].me;
-                for Action::Send(to, m) in nodes[i].ready() {
-                    nodes[(to - 1) as usize].on_message(from, m);
+                for Action::Call(to, req) in nodes[i].ready() {
+                    let resp = nodes[(to - 1) as usize].on_request(from, req);
+                    nodes[i].on_response(to, resp);
                     moved = true;
                 }
             }
@@ -1276,18 +1162,20 @@ mod tests {
         }
     }
 
-    /// Deliver every queued message between two nodes until both are quiet.
+    /// The same for two nodes.
     fn exchange(a: &mut Lease<u32, &'static str>, b: &mut Lease<u32, &'static str>) {
         for _ in 0..8 {
             let mut moved = false;
-            for Action::Send(to, m) in a.ready() {
+            for Action::Call(to, req) in a.ready() {
                 assert_eq!(to, b.me);
-                b.on_message(a.me, m);
+                let resp = b.on_request(a.me, req);
+                a.on_response(b.me, resp);
                 moved = true;
             }
-            for Action::Send(to, m) in b.ready() {
+            for Action::Call(to, req) in b.ready() {
                 assert_eq!(to, a.me);
-                a.on_message(b.me, m);
+                let resp = a.on_request(b.me, req);
+                b.on_response(a.me, resp);
                 moved = true;
             }
             if !moved {
@@ -1296,12 +1184,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_leader_holds_the_limit_and_everyone_else_nothing() {
+    fn pair() -> (Lease<u32, &'static str>, Lease<u32, &'static str>) {
         let mut l = node(1);
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        exchange(&mut c, &mut l);
+        (l, c)
+    }
+
+    #[test]
+    fn the_leader_holds_the_limit_and_everyone_else_nothing() {
+        let (mut l, mut c) = pair();
         assert!(l.is_leader());
         assert_eq!(l.stats(&BYTES).unwrap().granted, 1000);
         assert_eq!(c.stats(&BYTES).unwrap().granted, 0);
@@ -1311,12 +1206,7 @@ mod tests {
 
     #[test]
     fn a_child_asks_its_parent_and_is_leased_a_chunk() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut l); // the first report; the leader now covers everyone
+        let (mut l, mut c) = pair();
         assert!(c.acquire(&[(BYTES, 10)]).is_err(), "nothing held yet");
         c.tick(1);
         exchange(&mut c, &mut l);
@@ -1328,18 +1218,13 @@ mod tests {
 
     #[test]
     fn usage_flows_up_as_a_map_and_a_delete_flows_back() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut l);
-        let _ = c.acquire(&[(BYTES, 30)]); // refused: marks the quota wanted
+        let (mut l, mut c) = pair();
+        let _ = c.acquire(&[(BYTES, 30)]);
         c.tick(1);
         exchange(&mut c, &mut l);
         c.acquire(&[(BYTES, 30)]).unwrap();
         l.acquire(&[(BYTES, 5)]).unwrap();
-        c.tick(20); // a renewal is due
+        c.tick(20); // the keepalive carries the map
         exchange(&mut c, &mut l);
         assert_eq!(l.usage(&BYTES), 35);
         c.release(&BYTES, 10);
@@ -1350,12 +1235,7 @@ mod tests {
 
     #[test]
     fn a_lease_lapses_without_renewal_and_a_stock_refuses() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut l);
+        let (mut l, mut c) = pair();
         let _ = c.acquire(&[(BYTES, 10)]);
         c.tick(1);
         exchange(&mut c, &mut l);
@@ -1394,7 +1274,7 @@ mod tests {
         c.set_upstream(1);
         assert!(
             c.ready().is_empty(),
-            "nothing held, nothing wanted: no report"
+            "nothing held, nothing wanted: no call"
         );
         c.tick(50);
         assert!(c.ready().is_empty(), "nor a keepalive");
@@ -1410,12 +1290,7 @@ mod tests {
 
     #[test]
     fn removing_a_limit_hands_it_back_and_forgets_it() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut l);
+        let (mut l, mut c) = pair();
         let _ = c.acquire(&[(BYTES, 10)]);
         c.tick(1);
         exchange(&mut c, &mut l);
@@ -1425,27 +1300,19 @@ mod tests {
         assert_eq!(l.stats(&BYTES).unwrap().lent, 0);
         assert!(c.stats(&BYTES).is_none());
         c.tick(20);
-        for Action::Send(_, m) in c.ready() {
-            assert!(!m
-                .items
-                .iter()
-                .any(|i| matches!(i, Item::Renew { key, .. } if *key == BYTES)));
+        for Action::Call(_, req) in c.ready() {
+            assert!(!req.items.iter().any(|i| i.key == BYTES));
         }
     }
 
     #[test]
-    fn a_stale_leader_steps_down_on_the_first_message_with_a_newer_term() {
-        let mut old = node(1);
-        let mut c = node(2);
-        old.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut old);
-        c.acquire(&[(BYTES, 1)]).ok();
+    fn a_stale_leader_steps_down_on_the_first_call_with_a_newer_term() {
+        let (mut old, mut c) = pair();
+        let _ = c.acquire(&[(BYTES, 1)]);
         c.tick(1);
         exchange(&mut c, &mut old); // c holds a chunk from the old leader
-                                    // Raft moved on; the child heard, the old leader did not. The child's crown hands
-                                    // the chunk back, and that message carries the new term.
+                                    // Raft moved on; the child heard, the old leader did not. The child's crown tells the
+                                    // old parent it holds nothing from it, and that call carries the new term.
         c.set_cluster_view(None, 2, 2);
         assert!(c.is_leader());
         c.tick(1);
@@ -1460,12 +1327,7 @@ mod tests {
 
     #[test]
     fn a_rate_share_is_a_token_bucket() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
-        exchange(&mut c, &mut l);
+        let (mut l, mut c) = pair();
         assert!(
             c.acquire(&[(RPS, 1)]).is_ok(),
             "unleased: admitted, and asked"
@@ -1521,7 +1383,7 @@ mod tests {
         ns[2].set_upstream(2);
         route(&mut ns);
         let _ = ns[2].acquire(&[(BYTES, 10)]);
-        for _ in 0..3 {
+        for _ in 0..4 {
             for n in ns.iter_mut() {
                 n.tick(1);
             }
@@ -1534,7 +1396,7 @@ mod tests {
         );
         assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 100);
         // The middle node goes silent; the child's lease lapses, then it moves under the
-        // leader. The adoption is confirmed, and the deferred release reaches the old parent.
+        // leader. The adoption is confirmed, and the old parent is told.
         ns[2].tick(41);
         ns[2].set_upstream(1);
         ns[2].set_upstream(1);
@@ -1542,7 +1404,7 @@ mod tests {
         assert_eq!(
             ns[1].stats(&BYTES).unwrap().lent,
             0,
-            "the old parent books nothing for it"
+            "the old parent books nothing"
         );
         let booked: u64 = ns[1]
             .quotas
@@ -1551,6 +1413,33 @@ mod tests {
             .map(|b| b.granted)
             .sum();
         assert_eq!(booked, 0, "nor does any booking for it survive");
+    }
+
+    #[test]
+    fn a_shortfall_is_forwarded_and_the_child_told_to_ask_again_soon() {
+        let mut ns = vec![node(1), node(2), node(3)];
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        }
+        ns[1].set_upstream(1);
+        ns[2].set_upstream(2);
+        route(&mut ns);
+        let _ = ns[2].acquire(&[(BYTES, 10)]);
+        ns[2].tick(1);
+        // The child's call reaches the middle node, which has nothing and says so.
+        let Action::Call(to, req) = ns[2].ready().remove(0);
+        assert_eq!(to, 2);
+        let resp = ns[1].on_request(3, req);
+        assert!(resp.items[0].pending, "the middle node is asking upward");
+        assert_eq!(resp.items[0].grant, 0);
+        ns[2].on_response(2, resp);
+        // The middle node asks the leader at its next tick; the child asks again after a
+        // round trip and gets the chunk the middle node fetched for it.
+        ns[1].tick(1);
+        route(&mut ns);
+        ns[2].tick(2);
+        route(&mut ns);
+        assert_eq!(ns[2].stats(&BYTES).unwrap().granted, 100);
     }
 
     #[test]
@@ -1568,37 +1457,18 @@ mod tests {
     fn a_stock_s_usage_comes_with_the_limit_and_merges_by_max() {
         let mut n = node(1);
         n.set_cluster_view(Some(&[1]), 1, 1);
-        n.set_limit(
-            BYTES,
-            Limit::Stock {
-                limit: 1000,
-                chunk: 100,
-                acquired: 300,
-                released: 50,
-            },
-        );
+        let with = |acquired, released| Limit::Stock {
+            limit: 1000,
+            chunk: 100,
+            acquired,
+            released,
+        };
+        n.set_limit(BYTES, with(300, 50));
         assert_eq!(n.usage(&BYTES), 250);
         n.acquire(&[(BYTES, 10)]).unwrap();
-        // A stale restore changes nothing; a newer one is taken.
-        n.set_limit(
-            BYTES,
-            Limit::Stock {
-                limit: 1000,
-                chunk: 100,
-                acquired: 0,
-                released: 0,
-            },
-        );
+        n.set_limit(BYTES, with(0, 0)); // a stale restore changes nothing
         assert_eq!(n.usage(&BYTES), 260);
-        n.set_limit(
-            BYTES,
-            Limit::Stock {
-                limit: 1000,
-                chunk: 100,
-                acquired: 400,
-                released: 50,
-            },
-        );
+        n.set_limit(BYTES, with(400, 50)); // a newer one is taken
         assert_eq!(n.usage(&BYTES), 350);
     }
 
@@ -1606,23 +1476,14 @@ mod tests {
     fn the_child_s_lease_ends_before_the_parent_s_booking() {
         // Dated from sending at the child, from arrival at the parent: the parent can never
         // re-lend room the child still considers its own.
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
+        let (mut l, mut c) = pair();
         let _ = c.acquire(&[(BYTES, 10)]);
-        // Advance the clocks apart from each other: the child's request goes at 100, arrives
-        // at 101, is acked at 102.
+        // The child's call goes at 100, arrives at 101, is answered at 102.
         c.tick(100);
         l.tick(101);
-        let mut from_c = c.ready();
-        assert_eq!(from_c.len(), 1);
-        let Action::Send(_, m) = from_c.remove(0);
-        l.on_message(2, m);
-        for Action::Send(_, m) in l.ready() {
-            c.on_message(1, m);
-        }
+        let Action::Call(_, req) = c.ready().remove(0);
+        let resp = l.on_request(2, req);
+        c.on_response(1, resp);
         assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
         assert_eq!(c.stats(&BYTES).unwrap().valid_until, 140, "100 + ttl");
         c.tick(40); // 140: the last good tick
@@ -1637,11 +1498,7 @@ mod tests {
 
     #[test]
     fn a_new_term_fences_a_stock_until_confirmed_and_not_a_rate() {
-        let mut l = node(1);
-        let mut c = node(2);
-        l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_cluster_view(Some(&[1, 2]), 1, 1);
-        c.set_upstream(1);
+        let (mut l, mut c) = pair();
         let _ = c.acquire(&[(BYTES, 10), (RPS, 1)]);
         c.tick(1);
         exchange(&mut c, &mut l);
@@ -1662,7 +1519,7 @@ mod tests {
         );
         l.set_cluster_view(None, 1, 2);
         c.tick(1);
-        exchange(&mut c, &mut l); // the report goes out at once; the ack carries term 2
+        exchange(&mut c, &mut l); // the call goes out at once; the answer carries term 2
         assert!(c.acquire(&[(BYTES, 10)]).is_ok(), "confirmed");
     }
 }
