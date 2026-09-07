@@ -77,8 +77,10 @@
 //!   in their next answers. A cut walks down at up to `ttl / 2` per level, and what the
 //!   subtree writes meanwhile is the stock's overshoot: only under a full quota during a
 //!   re-orientation, and accepted. A rate is never cut.
-//! - A node keeps its parent while that parent keeps delivering the leader's traffic, and
-//!   never takes its own child as parent.
+//! - A node's parent is the peer the overlay delivers the leader's traffic through; it moves
+//!   to a new deliverer once that peer has delivered twice in a row, and never to its own
+//!   child. The lease tree follows the overlay's tree and its changes, two deliveries behind,
+//!   and does not follow a single detour.
 //! - A node drops a lease the moment it lapses: the parent has re-lent that room.
 //! - A new leader grants nothing and cuts nobody until its reports cover every live member,
 //!   or one `ttl` has passed.
