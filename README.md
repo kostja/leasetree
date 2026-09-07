@@ -45,7 +45,7 @@ pub struct LeaseResponse<Id, K> {
 }
 pub struct ResponseItem<K> {
     pub key: K,
-    pub grant: u64,                         // this much more is yours
+    pub total: u64,                         // your share now: a total, not a delta
 }
 ```
 
@@ -56,12 +56,15 @@ call that goes unanswered is sent again on the same backoff, keepalive or not: o
 lost keepalive would let the share lapse, since the next keepalive's answer lands one tick
 after the share's validity ends.
 
-`wanted` is what the child would take. The parent gives what it has, remembers the rest for
-this child and asks its own parent for it, and what it fetches for a waiting child it never
-hands back as spare; the child finds it on its retry. A release is a smaller `granted`; a node
-that moved tells its old parent `granted: 0`. A parent books what the child reports, and
-`seen` lets it tell, on its own clock, whether a report was sent before its last grant
-arrived; no clock is ever compared across nodes.
+`wanted` is what the child would take. The parent answers with the child's share as a total,
+its entitlement in the split below; what it could not give it remembers for this child and
+asks its own parent for, and what it fetches for a waiting child it never hands back as spare.
+A total is idempotent: a re-sent request gets the same answer and lends nothing more, and
+a total below what the child holds is a cut, which the child adopts. The child adopts only the
+answer to its latest request. A release is a smaller `granted`; a node that moved tells its
+old parent `granted: 0`. A parent books what the child reports, and `seen` lets it tell, on
+its own clock, whether a report was sent before its last answer arrived, in which case its own
+booking stands; no clock is ever compared across nodes.
 
 ### The rules
 
@@ -90,6 +93,22 @@ one lost call does not lapse its share. Everything else is change-driven, at the
 what the node holds changed, what it wants changed, or its term did. And the parent's booking
 is what the child says it holds, not what the parent sent: a grant that never arrived, a share
 handed back, a share adopted from another parent, all reconcile on the next call.
+
+**A parent splits its share among its claimants by weighted max-min fairness.** The claimants
+are its children and itself. A child's demand is what it holds and wants, as reported; its
+weight is its subtree size (`set_weights`); the parent's own use, measured as the tokens it
+drew over the last tick, weighs one. Water-filling: a level per unit of weight rises until
+the share is spent, a claimant whose demand is under its level gets its demand, and the rest is
+shared by weight among those still asking. A root of 75 with its own use 2, a 25-node child
+wanting 50 and a leaf wanting 100 gives 2, 50 and 23; were the 25 nodes to want 200, the
+level would be 75 / 27 per node: 2, 68 and 3. So a busy node in a small domain cannot take
+a large domain's share, an idle domain's share flows to whoever is busy, and a root that
+inherits more than its limit after a leader change cuts its children to their entitlements
+within one keepalive round. A child is cut only once it is more than a chunk over its
+entitlement, so a split that shifts by a unit does not churn; and a parent never lends beyond
+what it holds, so the room an over-entitled child frees on its keepalive goes to the next
+asker. Needs -- what a child already lent beyond its share, a moved subtree -- are demand
+like any other, served first within the child's entitlement.
 
 **A node without a share admits everything and asks for one.** Without the asking half a
 node would stay outside the limit for good, since nothing is ever refused to it. Node C has a

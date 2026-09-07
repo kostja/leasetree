@@ -144,8 +144,9 @@ pub struct LeaseRequest<Id, K> {
 pub struct ResponseItem<K> {
     /// The limit.
     pub key: K,
-    /// This much more is the child's.
-    pub grant: u64,
+    /// The child's share now: what it may keep. A total, not a delta, so an answer to a
+    /// re-sent request is the same answer, and a parent can say "less".
+    pub total: u64,
 }
 
 /// parent -> child: the answer. A stale leader learns of its successor from `term` on the
@@ -237,6 +238,10 @@ struct Quota<Id: Ord + Clone> {
     /// Share a child gave back or lapsed: fetched for it, and handed back up at the next
     /// call, or a moved share would be counted twice.
     returning: u64,
+    /// Tokens drawn since the last tick, and the rate they made over the last tick: our
+    /// own use, a claimant in the split beside the children.
+    used: f64,
+    use_rate: f64,
 }
 
 impl<Id: Ord + Clone> Quota<Id> {
@@ -253,6 +258,8 @@ impl<Id: Ord + Clone> Quota<Id> {
             last_request: None,
             refusals: 0,
             returning: 0,
+            used: 0.0,
+            use_rate: 0.0,
         }
     }
     /// What we may still lend.
@@ -303,6 +310,8 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     quotas: BTreeMap<K, Quota<Id>>,
     /// The `sent` of the last answer applied from the current parent.
     seen: u64,
+    /// Each child's weight in a split: the size of its subtree. Unknown children weigh one.
+    weights: BTreeMap<Id, u64>,
     /// Something changed since the last call: call at the next tick.
     dirty: bool,
     last_call: u64,
@@ -329,6 +338,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             parent_misses: 0,
             quotas: BTreeMap::new(),
             seen: 0,
+            weights: BTreeMap::new(),
             dirty: false,
             last_call: 0,
             awaiting: None,
@@ -441,6 +451,12 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
+    /// The children's weights for a split: each one's subtree size, from the same view the
+    /// tree was computed from ([`tree::weights`]). A child not listed weighs one.
+    pub fn set_weights(&mut self, weights: &[(Id, u64)]) {
+        self.weights = weights.iter().cloned().collect();
+    }
+
     /// The parent is known exactly -- computed from a cluster view every node shares, say --
     /// so take `peer` as parent now, with none of [`set_upstream`](Lease::set_upstream)'s
     /// hysteresis. A peer that was our child stops being one first, so a reordering that
@@ -495,13 +511,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let ttl = self.cfg.ttl;
         let now = self.now;
         let can_ask = self.parent.is_some();
+        let weight = |c: &Id| self.weights.get(c).copied().unwrap_or(1);
         let mut items = Vec::with_capacity(req.items.len());
         for it in req.items {
             let Some(q) = self.quotas.get_mut(&it.key) else {
                 continue;
             };
-            // Book what the child reports. A report sent before our last gift reached the
-            // child does not include it: keep the booking.
+            // Book what the child reports. A report sent before our last answer reached
+            // the child does not know it: keep our booking, gift or cut.
             let (old, given_at) = q
                 .children
                 .get(&from)
@@ -509,7 +526,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let booked = if req.seen >= given_at {
                 it.granted
             } else {
-                old.max(it.granted)
+                old
             };
             if old != booked {
                 self.dirty = true;
@@ -518,19 +535,52 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 q.returning += old - booked;
             }
             q.lent = q.lent - old + booked;
-            // Needs first, from all the room; wants only from room not reserved for other
-            // children's needs. Remember the rest and ask upward for it.
-            let others_need = q.reserved() - q.children.get(&from).map_or(0, |b| b.needed);
-            let give_need = it.needed.min(q.room());
-            let free = q
-                .room()
-                .saturating_sub(give_need)
-                .saturating_sub(others_need);
-            let give_want = it.wanted.min(free);
-            let give = give_need + give_want;
-            q.lent += give;
+            // The child's entitlement: our share split among every claimant by weighted
+            // max-min fairness on what each holds and wants -- this child as it just
+            // reported, the others as booked, and our own use at weight one.
+            // Claimants in id order, so a remainder always lands on the same child whoever
+            // is asking; this child at what it just reported, the others as booked, and our
+            // own use last.
+            let demand = booked.saturating_add(it.needed).saturating_add(it.wanted);
+            let mut claims: Vec<(u64, u64)> = Vec::with_capacity(q.children.len() + 2);
+            let mut mine = None;
+            for (c, b) in &q.children {
+                if *c == from {
+                    continue;
+                }
+                if mine.is_none() && *c > from {
+                    mine = Some(claims.len());
+                    claims.push((weight(&from), demand));
+                }
+                claims.push((
+                    weight(c),
+                    b.granted.saturating_add(b.needed).saturating_add(b.wanted),
+                ));
+            }
+            let mine = mine.unwrap_or_else(|| {
+                claims.push((weight(&from), demand));
+                claims.len() - 1
+            });
+            let own = (q.use_rate.ceil() as u64).saturating_add(q.wanted);
+            claims.push((1, own));
+            let fair = water_fill(q.granted, &claims)[mine];
+            // Past a chunk over its entitlement the child is cut to it. Otherwise it may
+            // take up to its entitlement, but never more than we hold: the others are cut
+            // on their own keepalives, and the room frees up.
+            let total = if booked > fair.saturating_add(q.limit.chunk) {
+                fair
+            } else {
+                demand
+                    .min(fair)
+                    .max(booked)
+                    .min(booked.saturating_add(q.room()))
+            };
+            let give = total.saturating_sub(booked);
+            let give_need = give.min(it.needed);
+            let give_want = give - give_need;
             let short_need = it.needed - give_need;
             let short_want = it.wanted - give_want;
+            q.lent = q.lent - booked + total;
             if (short_need > 0 || short_want > 0) && can_ask {
                 // New demand from below: ask upward at the next tick.
                 q.last_request = None;
@@ -542,17 +592,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 wanted: 0,
                 needed: 0,
             });
-            b.granted = booked + give;
-            if give > 0 {
+            b.granted = total;
+            if total != booked {
                 b.given_at = now;
             }
             b.expires = now + ttl;
             b.wanted = short_want;
             b.needed = short_need;
-            items.push(ResponseItem {
-                key: it.key,
-                grant: give,
-            });
+            items.push(ResponseItem { key: it.key, total });
         }
         // A child that holds nothing and wants nothing of any limit is no longer a child.
         let still = self.quotas.values().any(|q| {
@@ -586,6 +633,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         if self.parent.as_ref() != Some(&from) {
             return self.woke(was_empty);
         }
+        // Only the answer to the latest request carries our share; an older one is stale.
+        if resp.in_reply_to < self.last_call {
+            return self.woke(was_empty);
+        }
         let ttl = self.cfg.ttl;
         self.seen = self.seen.max(resp.sent);
         if self.awaiting.is_some_and(|sent| resp.in_reply_to >= sent) {
@@ -596,16 +647,24 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let Some(q) = self.quotas.get_mut(&it.key) else {
                 continue;
             };
-            q.granted += it.grant;
-            if it.grant > 0 {
-                q.reported += it.grant;
+            let old = q.granted;
+            q.granted = it.total;
+            q.reported = it.total;
+            if it.total > old {
+                let got = it.total - old;
                 // What arrived goes to the children waiting for it first; only the rest
                 // counts against our own want, or a child would take what we asked for.
-                let spoken_for = q.need().saturating_add(q.earmarked()).min(it.grant);
-                q.wanted = q.wanted.saturating_sub(it.grant - spoken_for);
+                let spoken_for = q.need().saturating_add(q.earmarked()).min(got);
+                q.wanted = q.wanted.saturating_sub(got - spoken_for);
                 q.refusals = 0;
             } else if q.ask() > 0 {
                 q.refusals = q.refusals.saturating_add(1);
+            }
+            if it.total < old {
+                // A cut: the bucket shrinks with the share, and the children are cut on
+                // their keepalives, since our split now has less to split.
+                q.tokens = q.tokens.min(q.refill().max(1.0) * 2.0);
+                self.dirty = true;
             }
             q.valid_until = Some(q.valid_until.unwrap_or(0).max(resp.in_reply_to + ttl));
         }
@@ -620,6 +679,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let now = self.now;
         let leader = self.is_leader();
         for q in self.quotas.values_mut() {
+            q.use_rate = q.used / n as f64;
+            q.used = 0.0;
             let refill = q.refill();
             q.tokens = (q.tokens + refill * n as f64).min(refill.max(1.0) * 2.0);
             let gone: Vec<Id> = q
@@ -703,6 +764,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             if good {
                 q.tokens -= *amount as f64;
             }
+            q.used += *amount as f64;
         }
         Ok(())
     }
@@ -964,6 +1026,56 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 }
 
+/// Weighted max-min fairness: split `total` among claimants of `(weight, demand)`. A common
+/// level per unit of weight rises until the total is spent; a claimant whose demand is below
+/// its level gets its demand, and the rest is shared among those still asking, in proportion
+/// to weight. Integer; a remainder goes to the earliest claimants still asking.
+fn water_fill(total: u64, claims: &[(u64, u64)]) -> Vec<u64> {
+    let mut out = vec![0u64; claims.len()];
+    let mut active: Vec<usize> = (0..claims.len()).collect();
+    let mut left = total;
+    loop {
+        let weight: u64 = active.iter().map(|&i| claims[i].0.max(1)).sum();
+        if weight == 0 || left == 0 {
+            break;
+        }
+        // Satisfy everyone whose demand fits under the level.
+        let satisfied: Vec<usize> = active
+            .iter()
+            .copied()
+            .filter(|&i| {
+                claims[i].1.saturating_mul(weight) <= left.saturating_mul(claims[i].0.max(1))
+            })
+            .collect();
+        if satisfied.is_empty() {
+            // Everyone left wants more than its level: share what is left by weight.
+            let mut given = 0;
+            for &i in &active {
+                out[i] = left * claims[i].0.max(1) / weight;
+                given += out[i];
+            }
+            let mut rest = left - given;
+            for &i in &active {
+                if rest == 0 {
+                    break;
+                }
+                out[i] += 1;
+                rest -= 1;
+            }
+            break;
+        }
+        for i in satisfied {
+            out[i] = claims[i].1;
+            left -= claims[i].1;
+            active.retain(|&a| a != i);
+        }
+        if active.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,7 +1270,7 @@ mod tests {
         let Action::Call(to, req) = ns[2].ready().remove(0);
         assert_eq!(to, 2);
         let resp = ns[1].on_request(3, req);
-        assert_eq!(resp.items[0].grant, 0, "the middle node has nothing");
+        assert_eq!(resp.items[0].total, 0, "the middle node has nothing");
         ns[2].on_response(2, resp);
         ns[1].tick(1);
         route(&mut ns);
@@ -1307,7 +1419,7 @@ mod tests {
                 sent: 0,
                 items: vec![ResponseItem {
                     key: RPS,
-                    grant: 500,
+                    total: 500,
                 }],
             },
         );
@@ -1411,6 +1523,8 @@ mod tests {
         }
         let a = ns[1].stats(&RPS).unwrap();
         assert_eq!(a.overcommit, 0, "A's need was served\n{}", dump(&ns));
+        // C is entitled to 2 of the 6 by the split, but A is over its own entitlement by one
+        // chunk exactly, and a cut only comes past a chunk: C waits.
         assert_eq!(ns[4].stats(&RPS).unwrap().granted, 0, "C's want was not");
         let refills: u64 = ns
             .iter()
@@ -1530,5 +1644,123 @@ mod tests {
             );
         }
         assert!(child.stats(&"k").unwrap().good);
+    }
+
+    #[test]
+    fn water_fill_gives_demands_below_the_level_and_shares_the_rest_by_weight() {
+        // The example: a root of 75, its own use 2, a 25-node child wanting 50, a leaf
+        // wanting 100.
+        assert_eq!(
+            water_fill(75, &[(1, 2), (25, 50), (1, 100)]),
+            vec![2, 50, 23]
+        );
+        // Everyone wants more than its level: by weight, remainder to the first.
+        assert_eq!(water_fill(30, &[(1, 100), (3, 100)]), vec![8, 22]);
+        assert_eq!(water_fill(10, &[(1, 3), (1, 3)]), vec![3, 3]);
+        assert_eq!(water_fill(0, &[(1, 3)]), vec![0]);
+    }
+
+    fn leader_with(limit: u64) -> Lease<u32, &'static str> {
+        let mut l = Lease::new(1, Config { ttl: 20 });
+        l.set_limit(RPS, Limit { limit, chunk: 2 });
+        l.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        l
+    }
+
+    fn ask(granted: u64, wanted: u64, sent: u64) -> LeaseRequest<u32, &'static str> {
+        LeaseRequest {
+            term: 1,
+            leader: Some(1),
+            sent,
+            seen: sent,
+            items: vec![RequestItem {
+                key: RPS,
+                granted,
+                needed: 0,
+                wanted,
+            }],
+        }
+    }
+
+    #[test]
+    fn two_children_wanting_everything_get_half_each() {
+        let mut l = leader_with(75);
+        let a = l.on_request(2, ask(0, 100, 1)).items[0].total;
+        let b = l.on_request(3, ask(0, 100, 1)).items[0].total;
+        // The first asker took what its level allowed before the second was known; a
+        // second keepalive settles both at half, the leader's own use taking nothing.
+        let a2 = l.on_request(2, ask(a, 100, 2)).items[0].total;
+        let b2 = l.on_request(3, ask(b, 100, 2)).items[0].total;
+        assert!(a2.abs_diff(b2) <= 1, "{a2} vs {b2}");
+        assert!((74..=75).contains(&(a2 + b2)), "{a2} + {b2}");
+    }
+
+    #[test]
+    fn a_child_s_share_follows_its_weight() {
+        let mut l = leader_with(80);
+        l.set_weights(&[(2, 1), (3, 3)]);
+        let mut a = 0;
+        let mut b = 0;
+        for round in 1..4 {
+            a = l.on_request(2, ask(a, 100, round)).items[0].total;
+            b = l.on_request(3, ask(b, 100, round)).items[0].total;
+        }
+        assert_eq!((a, b), (20, 60), "one to three");
+    }
+
+    #[test]
+    fn an_overcommitted_root_cuts_its_children_to_their_entitlement() {
+        // After a leader change two children report holding 48 each against a limit of 75.
+        let mut l = leader_with(75);
+        let a0 = l.on_request(2, ask(48, 0, 1)).items[0].total;
+        let b0 = l.on_request(3, ask(48, 0, 1)).items[0].total;
+        assert!(
+            l.stats(&RPS).unwrap().lent <= 96,
+            "booked as reported, or already cut"
+        );
+        // Their keepalives bring them down to a fair split.
+        let a = l.on_request(2, ask(a0, 0, 2)).items[0].total;
+        let b = l.on_request(3, ask(b0, 0, 2)).items[0].total;
+        assert!(a <= 38 && b <= 38, "{a} and {b}");
+        assert!(
+            l.stats(&RPS).unwrap().lent <= 75,
+            "{a} {b} {:?}",
+            l.stats(&RPS).unwrap()
+        );
+        assert_eq!(l.stats(&RPS).unwrap().overcommit, 0);
+    }
+
+    #[test]
+    fn a_re_sent_request_gets_the_same_total_and_lends_nothing_more() {
+        let mut l = leader_with(75);
+        let first = l.on_request(2, ask(0, 10, 1)).items[0].total;
+        let lent = l.stats(&RPS).unwrap().lent;
+        // The same request again, as a retry sends it: the child has not seen the answer.
+        let again = l.on_request(2, ask(0, 10, 1)).items[0].total;
+        assert_eq!(again, first);
+        assert_eq!(l.stats(&RPS).unwrap().lent, lent);
+    }
+
+    #[test]
+    fn a_child_adopts_the_total_from_the_latest_answer_only() {
+        let mut ns = pair();
+        let _ = ns[1].acquire(&[(RPS, 1)]);
+        ns[1].tick(1);
+        let Action::Call(_, req) = ns[1].ready().remove(0);
+        let resp = ns[0].on_request(2, req);
+        ns[1].on_response(1, resp.clone());
+        let held = ns[1].stats(&RPS).unwrap().granted;
+        assert!(held > 0);
+        // A cut arrives: the share follows it down.
+        let mut cut = resp.clone();
+        cut.items[0].total = 1;
+        ns[1].on_response(1, cut);
+        assert_eq!(ns[1].stats(&RPS).unwrap().granted, 1);
+        // An answer to an older request is ignored.
+        let mut stale = resp;
+        stale.in_reply_to = 0;
+        stale.items[0].total = 500;
+        ns[1].on_response(1, stale);
+        assert_eq!(ns[1].stats(&RPS).unwrap().granted, 1);
     }
 }

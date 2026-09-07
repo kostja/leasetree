@@ -92,6 +92,47 @@ where
     Some(Place::Under(trie_parent(*me)?))
 }
 
+/// The subtree size of each of `me`'s children in the tree over `members` rooted at
+/// `leader`: the number of members whose chain of parents passes through the child, the
+/// child included. The weights for [`Lease::set_weights`](crate::Lease::set_weights).
+pub fn weights<Id, D>(me: &Id, leader: &Id, members: &[(Id, D)], radix: usize) -> Vec<(Id, u64)>
+where
+    Id: Ord + Copy + Into<u64>,
+    D: Eq,
+{
+    let parents: Vec<(Id, Option<Id>)> = members
+        .iter()
+        .filter_map(|(id, _)| {
+            place(id, leader, members, radix).map(|p| match p {
+                Place::Root => (*id, None),
+                Place::Under(p) => (*id, Some(p)),
+            })
+        })
+        .collect();
+    let parent_of = |id: Id| parents.iter().find(|(x, _)| *x == id).and_then(|(_, p)| *p);
+    let mut out: Vec<(Id, u64)> = parents
+        .iter()
+        .filter(|(_, p)| *p == Some(*me))
+        .map(|(c, _)| (*c, 0))
+        .collect();
+    for (id, _) in &parents {
+        // Climb to the root; every child of `me` on the way counts this member once.
+        let mut at = Some(*id);
+        let mut hops = 0;
+        while let Some(x) = at {
+            if let Some(w) = out.iter_mut().find(|(c, _)| *c == x) {
+                w.1 += 1;
+            }
+            at = parent_of(x);
+            hops += 1;
+            if hops > parents.len() {
+                break;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +279,24 @@ mod tests {
         );
         assert_eq!(place(&9, &1, &members, 2), None, "we are not a member");
         assert_eq!(place(&1, &1, &members, 2), Some(Place::Root));
+    }
+
+    #[test]
+    fn weights_are_subtree_sizes() {
+        // One domain, radix 4, root 1: 4 carries 5, 6, 7; 16 carries 17..=31; 2 is a leaf.
+        let members = by_mod(31, 1);
+        let w: BTreeMap<u64, u64> = weights(&1, &1, &members, 4).into_iter().collect();
+        assert_eq!(w[&2], 1);
+        assert_eq!(w[&4], 4);
+        assert_eq!(w[&16], 16);
+        assert_eq!(
+            w.values().sum::<u64>(),
+            30,
+            "every other member is under one child"
+        );
+        // Nine nodes, three domains, leader 5: the gateways carry their domains.
+        let members = by_mod(9, 3);
+        let w: BTreeMap<u64, u64> = weights(&5, &5, &members, 2).into_iter().collect();
+        assert_eq!((w[&3], w[&1], w[&2]), (3, 3, 2));
     }
 }
