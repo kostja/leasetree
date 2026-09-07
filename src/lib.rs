@@ -105,17 +105,27 @@ pub struct Limit {
 }
 
 /// One limit in a [`LeaseRequest`].
+///
+/// Each edge of the tree carries two counters that only grow: `given`, kept by the parent,
+/// what it ever handed this child; and `returned`, kept by the child, what it ever handed
+/// back. The share is the difference. The parent merges `returned` by max, the child adopts
+/// `given` from answers in order, so a re-sent request, a lost answer or a restarted parent
+/// all reconcile on the next exchange with no ordering state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RequestItem<K> {
     /// The limit.
     pub key: K,
-    /// What the child holds from the parent. Less than before is a release; zero to an old
-    /// parent lets it go entirely.
-    pub granted: u64,
-    /// What the child has already lent beyond its share: a moved subtree it adopted. Served
-    /// before any `wanted`, by everyone up the tree, or a moved share is counted twice for
-    /// as long as the rate is contended.
+    /// What the child knows the parent has handed it, ever: the `given` it last adopted.
+    /// The parent reads the wants below against this, so a want made before an answer
+    /// arrived is not served twice.
+    pub given: u64,
+    /// What the child has handed back to this parent, ever. A release raises it; raising it
+    /// to `given` lets the parent go entirely.
+    pub returned: u64,
+    /// What the child has already lent beyond its share: a moved subtree it adopted, or a
+    /// cut from above it has not passed on yet. Demand like any other, served first within
+    /// the child's entitlement.
     pub needed: u64,
     /// What more the child would take.
     pub wanted: u64,
@@ -131,9 +141,6 @@ pub struct LeaseRequest<Id, K> {
     pub leader: Option<Id>,
     /// The child's tick. A share is dated from it.
     pub sent: u64,
-    /// The `sent` of the last answer the child applied from this parent, so the parent can
-    /// tell, on its own clock, whether the report includes its last gift.
-    pub seen: u64,
     /// The limits.
     pub items: Vec<RequestItem<K>>,
 }
@@ -144,9 +151,11 @@ pub struct LeaseRequest<Id, K> {
 pub struct ResponseItem<K> {
     /// The limit.
     pub key: K,
-    /// The child's share now: what it may keep. A total, not a delta, so an answer to a
-    /// re-sent request is the same answer, and a parent can say "less".
-    pub total: u64,
+    /// What the parent has handed this child, ever. The child adopts it.
+    pub given: u64,
+    /// What the parent counts as handed back, ever: the child's own returns, and cuts the
+    /// parent made. The child takes the larger of its own and this.
+    pub returned: u64,
 }
 
 /// parent -> child: the answer. A stale leader learns of its successor from `term` on the
@@ -158,9 +167,9 @@ pub struct LeaseResponse<Id, K> {
     pub term: u64,
     /// The parent's leader.
     pub leader: Option<Id>,
-    /// The `sent` of the request answered.
+    /// The `sent` of the request answered. The child applies answers in this order.
     pub in_reply_to: u64,
-    /// The parent's tick. The child echoes it as `seen` in its next request.
+    /// The parent's tick, for the log.
     pub sent: u64,
     /// The limits, in the request's order.
     pub items: Vec<ResponseItem<K>>,
@@ -201,43 +210,48 @@ pub struct Stats {
     pub good: bool,
 }
 
-/// What a parent books for one child on one limit.
-#[derive(Clone, Debug)]
+/// What a parent books for one child on one limit: the edge's two counters, and what the
+/// child asked for and did not get.
+#[derive(Clone, Debug, Default)]
 struct Booking {
-    granted: u64,
+    given: u64,
+    returned: u64,
     expires: u64,
-    /// When we last gave this child more: a report sent before that is stale by the gift.
-    given_at: u64,
     /// What the child asked for and did not get: earmarked, so that what we fetch for it is
     /// not handed back as spare before it asks again.
     wanted: u64,
-    /// What the child needs and did not get: reserved, so that no want is served from room
-    /// while a need is outstanding.
+    /// What the child needs and did not get.
     needed: u64,
+}
+
+impl Booking {
+    fn share(&self) -> u64 {
+        self.given.saturating_sub(self.returned)
+    }
+    /// Holds something, or waits for something: a child. Otherwise a former one whose
+    /// counters we keep, so that it can come back and catch up.
+    fn active(&self) -> bool {
+        self.share() > 0 || self.wanted > 0 || self.needed > 0
+    }
 }
 
 /// One limit's state on this node.
 struct Quota<Id: Ord + Clone> {
     limit: Limit,
-    /// The share: units per tick.
-    granted: u64,
+    /// The edge to the parent: what it gave us, ever, and what we gave back, ever. The
+    /// share is the difference. On the leader `given` is the whole rate.
+    given: u64,
+    returned: u64,
     tokens: f64,
-    lent: u64,
     children: BTreeMap<Id, Booking>,
     /// Until when the share is good; `None` while there is none.
     valid_until: Option<u64>,
     /// How much more we want from the parent; asked at the next tick.
     wanted: u64,
-    /// The share last reported to the parent, or given by it: a change is reported once
-    /// more, even to zero.
-    reported: u64,
     last_request: Option<u64>,
     /// Asks answered with nothing, in a row: the next one waits twice as long, up to
     /// `ttl / 8`.
     refusals: u32,
-    /// Share a child gave back or lapsed: fetched for it, and handed back up at the next
-    /// call, or a moved share would be counted twice.
-    returning: u64,
     /// Tokens drawn since the last tick, and the rate they made over the last tick: our
     /// own use, a claimant in the split beside the children.
     used: f64,
@@ -251,27 +265,33 @@ impl<Id: Ord + Clone> Quota<Id> {
     fn new(limit: Limit) -> Self {
         Quota {
             limit,
-            granted: 0,
+            given: 0,
+            returned: 0,
             tokens: 0.0,
-            lent: 0,
             children: BTreeMap::new(),
             valid_until: None,
             wanted: 0,
-            reported: 0,
             last_request: None,
             refusals: 0,
-            returning: 0,
             used: 0.0,
             use_rate: 0.0,
             over_since: None,
         }
     }
+    /// The share: units per tick.
+    fn share(&self) -> u64 {
+        self.given.saturating_sub(self.returned)
+    }
+    /// What the children hold from us.
+    fn lent(&self) -> u64 {
+        self.children.values().map(Booking::share).sum()
+    }
     /// What we may still lend.
     fn room(&self) -> u64 {
-        self.granted.saturating_sub(self.lent)
+        self.share().saturating_sub(self.lent())
     }
     fn overcommit(&self) -> u64 {
-        self.lent.saturating_sub(self.granted)
+        self.lent().saturating_sub(self.share())
     }
     /// Our own refill: the share minus what we lent.
     fn refill(&self) -> f64 {
@@ -297,6 +317,10 @@ impl<Id: Ord + Clone> Quota<Id> {
     fn ask(&self) -> u64 {
         self.need().saturating_add(self.want())
     }
+    /// Hand `amount` back to the parent, from the share.
+    fn hand_back(&mut self, amount: u64) {
+        self.returned = self.returned.saturating_add(amount.min(self.share()));
+    }
 }
 
 /// One node's lease state, for every limit.
@@ -312,8 +336,6 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     /// Deliveries of the leader's traffic through other peers since the parent last delivered.
     parent_misses: u32,
     quotas: BTreeMap<K, Quota<Id>>,
-    /// The `sent` of the last answer applied from the current parent.
-    seen: u64,
     /// Each child's weight in a split: the size of its subtree. Unknown children weigh one.
     weights: BTreeMap<Id, u64>,
     /// Something changed since the last call: call at the next tick.
@@ -324,11 +346,9 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     /// keepalive would lapse the share.
     awaiting: Option<u64>,
     unanswered: u32,
-    /// The `in_reply_to` of the last answer applied, and the tick our holdings last changed
-    /// by our own hand: an answer is applied only if it is newer than both, so answers
-    /// arrive in order and an older one cannot undo a return we made after asking.
+    /// The `in_reply_to` of the last answer applied: `given` is adopted from answers in
+    /// order, so an older answer cannot undo a newer gift.
     accepted: u64,
-    settled: u64,
     outbound: Vec<Action<Id, K>>,
 }
 
@@ -346,14 +366,12 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             parent: None,
             parent_misses: 0,
             quotas: BTreeMap::new(),
-            seen: 0,
             weights: BTreeMap::new(),
             dirty: false,
             last_call: 0,
             awaiting: None,
             unanswered: 0,
             accepted: 0,
-            settled: 0,
             outbound: Vec::new(),
         }
     }
@@ -372,14 +390,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
-    /// Forget a limit: tell the parent we hold nothing of it, and drop the key entirely.
-    /// Children holding it lapse; their own configuration drops it too.
+    /// Drop a limit: hand its share back to the parent and forget it. With nothing left in
+    /// play, nothing more goes on the wire.
     pub fn remove_limit(&mut self, key: &K) -> bool {
         let was_empty = self.outbound.is_empty();
         if let Some(q) = self.quotas.remove(key) {
             if let Some(p) = self.parent.clone() {
-                if q.granted > 0 || q.reported > 0 {
-                    let req = self.request_for(std::slice::from_ref(key));
+                if q.given > 0 {
+                    let req = self.request_for(&[(key.clone(), q.given)]);
                     self.outbound.push(Action::Call(p, req));
                 }
             }
@@ -512,7 +530,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     // ------------------------------------------------------------ the protocol
 
-    /// A call from a child. Returns the answer, for the RPC handler to send back.
+    // ------------------------------------------------------------ the protocol
+
+    /// A child's call. Book what it returned, work out its entitlement, give or cut, and
+    /// answer with the edge's counters. On the TX thread of the parent.
     pub fn on_request(&mut self, from: Id, req: LeaseRequest<Id, K>) -> LeaseResponse<Id, K> {
         if req.term > self.term {
             if let Some(l) = req.leader.clone() {
@@ -528,34 +549,35 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let Some(q) = self.quotas.get_mut(&it.key) else {
                 continue;
             };
-            // Book what the child reports. A report sent before our last answer reached
-            // the child does not know it: keep our booking, gift or cut.
-            let (old, given_at) = q
+            // Merge what the child returned. Its share is what we gave less that.
+            let (was_need, was_want) = q
                 .children
                 .get(&from)
-                .map_or((0, 0), |b| (b.granted, b.given_at));
-            let booked = if req.seen >= given_at {
-                it.granted
-            } else {
-                old
-            };
-            if old != booked {
+                .map_or((0, 0), |b| (b.needed, b.wanted));
+            let b = q.children.entry(from.clone()).or_default();
+            let mut came_back = 0;
+            if it.returned > b.returned {
+                let returned = it.returned.min(b.given);
+                came_back = returned - b.returned;
+                b.returned = returned;
                 self.dirty = true;
             }
-            if booked < old {
-                q.returning += old - booked;
-            }
-            q.lent = q.lent - old + booked;
-            if q.lent > q.granted && q.over_since.is_none() {
+            let booked = b.share();
+            // What the child wants is beyond the share it knows of; what we gave since
+            // covers it first.
+            let known = it.given.min(b.given).saturating_sub(b.returned);
+            let (share, lent) = (q.share(), q.lent());
+            if lent > share && q.over_since.is_none() {
                 q.over_since = Some(now);
             }
             // The child's entitlement: our share split among every claimant by weighted
             // max-min fairness on what each holds and wants -- this child as it just
-            // reported, the others as booked, and our own use at weight one.
-            // Claimants in id order, so a remainder always lands on the same child whoever
-            // is asking; this child at what it just reported, the others as booked, and our
-            // own use last.
-            let demand = booked.saturating_add(it.needed).saturating_add(it.wanted);
+            // reported, the others as booked, and our own use at weight one. Claimants in
+            // id order, so a remainder always lands on the same child whoever is asking.
+            let demand = known
+                .saturating_add(it.needed)
+                .saturating_add(it.wanted)
+                .max(booked);
             let mut claims: Vec<(u64, u64)> = Vec::with_capacity(q.children.len() + 2);
             let mut mine = None;
             for (c, b) in &q.children {
@@ -568,7 +590,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 }
                 claims.push((
                     weight(c),
-                    b.granted.saturating_add(b.needed).saturating_add(b.wanted),
+                    b.share().saturating_add(b.needed).saturating_add(b.wanted),
                 ));
             }
             let mine = mine.unwrap_or_else(|| {
@@ -577,7 +599,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             });
             let own = (q.use_rate.ceil() as u64).saturating_add(q.wanted);
             claims.push((1, own));
-            let fair = water_fill(q.granted, &claims)[mine];
+            let fair = water_fill(share, &claims)[mine];
             // Past a chunk over its entitlement the child is cut to it -- past anything at
             // all while we are over our own share, or a unit's overcommit would sit on
             // every level for good. Not while a keepalive round of grace runs on that
@@ -585,61 +607,54 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             // upward first, and our own answer may cover them. A root has nobody to ask.
             // Otherwise the child may take up to its entitlement, but never more than we
             // hold: the others are cut on their own keepalives, and the room frees up.
-            let over = q.lent > q.granted;
-            let grace = over
-                && self.parent.is_some()
-                && !q.over_since.is_some_and(|since| now >= since + ttl / 2);
+            let over = lent > share;
+            let grace =
+                over && can_ask && !q.over_since.is_some_and(|since| now >= since + ttl / 2);
             let slack = if over { 0 } else { q.limit.chunk };
+            let room = share.saturating_sub(lent);
             let total = if grace || booked <= fair.saturating_add(slack) {
                 demand
                     .min(fair)
                     .max(booked)
-                    .min(booked.saturating_add(q.room()))
+                    .min(booked.saturating_add(room))
             } else {
                 fair
             };
-            let give = total.saturating_sub(booked);
-            let give_need = give.min(it.needed);
-            let give_want = give - give_need;
+            // Served: what the child got beyond the share it knew of, needs first.
+            let served = total.saturating_sub(known);
+            let give_need = served.min(it.needed);
+            let give_want = (served - give_need).min(it.wanted);
             let short_need = it.needed - give_need;
             let short_want = it.wanted - give_want;
-            q.lent = q.lent - booked + total;
-            let (was_need, was_want) = q
-                .children
-                .get(&from)
-                .map_or((0, 0), |b| (b.needed, b.wanted));
+            // What a child gave back was fetched for it and is the tree's, not ours: hand
+            // it back up, or a share that moved is held twice, here and under its new
+            // parent. If we want more, we ask like anyone. A root keeps it: it is the rate.
+            if came_back > 0 && can_ask {
+                let back = came_back.min(share.saturating_sub(lent));
+                q.hand_back(back);
+            }
+            let b = q.children.get_mut(&from).expect("booked above");
+            if total > booked {
+                b.given += total - booked;
+            } else if total < booked {
+                // A cut: count the difference as returned. The child takes the larger of
+                // its own count and ours.
+                b.returned += booked - total;
+            }
             if (short_need > was_need || short_want > was_want) && can_ask {
                 // New demand from below: ask upward at the next tick. A shortfall already
                 // known is already asked for; asking again on every keepalive would be a
                 // call per tick with a few short children.
                 q.last_request = None;
             }
-            let b = q.children.entry(from.clone()).or_insert(Booking {
-                granted: 0,
-                expires: 0,
-                given_at: 0,
-                wanted: 0,
-                needed: 0,
-            });
-            b.granted = total;
-            if total != booked {
-                b.given_at = now;
-            }
             b.expires = now + ttl;
             b.wanted = short_want;
             b.needed = short_need;
-            items.push(ResponseItem { key: it.key, total });
-        }
-        // A child that holds nothing and wants nothing of any limit is no longer a child.
-        let still = self.quotas.values().any(|q| {
-            q.children
-                .get(&from)
-                .is_some_and(|b| b.granted > 0 || b.wanted > 0 || b.needed > 0)
-        });
-        if !still {
-            for q in self.quotas.values_mut() {
-                q.children.remove(&from);
-            }
+            items.push(ResponseItem {
+                key: it.key,
+                given: b.given,
+                returned: b.returned,
+            });
         }
         LeaseResponse {
             term: self.term,
@@ -651,7 +666,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     /// The answer to a call. Answers from anyone but the current parent only carry news of
-    /// the term.
+    /// the term. `given` is adopted from answers in order; `returned` is merged by max.
     pub fn on_response(&mut self, from: Id, resp: LeaseResponse<Id, K>) -> bool {
         let was_empty = self.outbound.is_empty();
         if resp.term > self.term {
@@ -662,27 +677,25 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         if self.parent.as_ref() != Some(&from) {
             return self.woke(was_empty);
         }
-        // Answers apply in order, and none older than our last change to what we hold:
-        // it answers a request that reported something else.
-        if resp.in_reply_to < self.accepted || resp.in_reply_to < self.settled {
+        if resp.in_reply_to < self.accepted {
             return self.woke(was_empty);
         }
         self.accepted = resp.in_reply_to;
-        let ttl = self.cfg.ttl;
-        self.seen = self.seen.max(resp.sent);
         if self.awaiting.is_some_and(|sent| resp.in_reply_to >= sent) {
             self.awaiting = None;
             self.unanswered = 0;
         }
+        let ttl = self.cfg.ttl;
         for it in resp.items {
             let Some(q) = self.quotas.get_mut(&it.key) else {
                 continue;
             };
-            let old = q.granted;
-            q.granted = it.total;
-            q.reported = it.total;
-            if it.total > old {
-                let got = it.total - old;
+            let old = q.share();
+            q.given = it.given;
+            q.returned = q.returned.max(it.returned);
+            let share = q.share();
+            if share > old {
+                let got = share - old;
                 // What arrived goes to the children waiting for it first; only the rest
                 // counts against our own want, or a child would take what we asked for.
                 let spoken_for = q.need().saturating_add(q.earmarked()).min(got);
@@ -691,7 +704,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             } else if q.ask() > 0 {
                 q.refusals = q.refusals.saturating_add(1);
             }
-            if it.total < old {
+            if share < old {
                 // A cut: the bucket shrinks to one tick of the new share, no burst, or every
                 // cut would leak one; and the children are cut on their keepalives, since
                 // our split now has less to split.
@@ -713,33 +726,36 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         for q in self.quotas.values_mut() {
             q.use_rate = q.used / n as f64;
             q.used = 0.0;
-            q.over_since = if q.lent > q.granted {
+            q.over_since = if q.lent() > q.share() {
                 Some(q.over_since.unwrap_or(now))
             } else {
                 None
             };
             let refill = q.refill();
             q.tokens = (q.tokens + refill * n as f64).min(refill.max(1.0) * 2.0);
-            let gone: Vec<Id> = q
-                .children
-                .iter()
-                .filter(|(_, b)| b.expires < now)
-                .map(|(c, _)| c.clone())
-                .collect();
-            for c in gone {
-                if let Some(b) = q.children.remove(&c) {
-                    q.lent -= b.granted;
-                    q.returning += b.granted;
+            // A child that stopped calling: its share is ours again. The counters stay, so
+            // that it can come back and catch up.
+            let mut expired = 0;
+            for b in q.children.values_mut() {
+                if b.expires < now && b.active() {
+                    expired += b.share();
+                    b.returned = b.given;
+                    b.wanted = 0;
+                    b.needed = 0;
                     self.dirty = true;
                 }
+            }
+            if expired > 0 && !leader {
+                let back = expired.min(q.room());
+                q.hand_back(back);
             }
             // A lapsed share has been re-lent by the parent: keep only what our children
             // hold, so the next report does not claim it.
             // No share at all counts as lapsed too: a demoted leader's leftover, say.
             let lapsed = q.valid_until.map_or(true, |v| now > v);
-            if !leader && lapsed && q.granted > q.lent {
-                q.granted = q.lent;
-                self.settled = now;
+            if !leader && lapsed && q.share() > q.lent() {
+                let back = q.share() - q.lent();
+                q.hand_back(back);
                 self.dirty = true;
             }
         }
@@ -814,32 +830,37 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.leader.as_ref() == Some(&self.me)
     }
 
-    /// This node's parent in the tree, if any.
+    /// The node this one leases from, if any.
     pub fn parent(&self) -> Option<&Id> {
         self.parent.as_ref()
     }
 
-    /// This node's children in the tree: the peers it books anything for.
+    /// The nodes that lease from this one, on any limit.
     pub fn children(&self) -> impl Iterator<Item = &Id> {
         let mut out: Vec<&Id> = self
             .quotas
             .values()
-            .flat_map(|q| q.children.keys())
+            .flat_map(|q| {
+                q.children
+                    .iter()
+                    .filter(|(_, b)| b.active())
+                    .map(|(c, _)| c)
+            })
             .collect();
         out.sort();
         out.dedup();
         out.into_iter()
     }
 
-    /// A limit's figures, for metrics.
+    /// One limit as this node sees it.
     pub fn stats(&self, key: &K) -> Option<Stats> {
         let q = self.quotas.get(key)?;
         Some(Stats {
-            granted: q.granted,
-            lent: q.lent,
+            granted: q.share(),
+            lent: q.lent(),
             overcommit: q.overcommit(),
             wanted: q.wanted,
-            children: q.children.len(),
+            children: q.children.values().filter(|b| b.active()).count(),
             tokens: q.tokens.floor() as u64,
             good: self.is_leader() || q.valid_until.is_some_and(|v| self.now <= v),
         })
@@ -860,8 +881,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         (ttl / 8).max(1)
     }
 
+    /// The leader holds the whole rate: the edge above it is a fiction of `limit`.
     fn hold_limit(q: &mut Quota<Id>) {
-        q.granted = q.limit.limit.max(q.lent);
+        let lent = q.lent();
+        q.returned = 0;
+        q.given = q.limit.limit.max(lent);
         q.valid_until = Some(u64::MAX);
         q.wanted = 0;
         q.refusals = 0;
@@ -869,106 +893,87 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
 
     /// Become the leader: hold the whole rate, and let the old parent go.
     fn crown(&mut self) {
-        let keys: Vec<K> = self
+        let release: Vec<(K, u64)> = self
             .quotas
             .iter()
-            .filter(|(_, q)| q.granted > 0 || q.reported > 0)
-            .map(|(k, _)| k.clone())
+            .filter(|(_, q)| q.given > 0)
+            .map(|(k, q)| (k.clone(), q.given))
             .collect();
-        for q in self.quotas.values_mut() {
-            Self::hold_limit(q);
-        }
         if let Some(op) = self.parent.take() {
-            if !keys.is_empty() {
-                let req = self.request_for(&keys);
+            if !release.is_empty() {
+                let req = self.request_for(&release);
                 self.outbound.push(Action::Call(op, req));
             }
         }
+        for q in self.quotas.values_mut() {
+            Self::hold_limit(q);
+        }
         self.parent_misses = 0;
     }
 
-    /// Stop being the leader: keep what is lent, drop the rest of the rate.
+    /// Stop being the leader: the rate is not ours; what our children hold, we now need.
     fn demote(&mut self) {
-        self.settled = self.now;
         for q in self.quotas.values_mut() {
-            q.granted = q.lent;
+            q.given = 0;
+            q.returned = 0;
             q.valid_until = None;
-            q.reported = 0;
         }
         self.parent = None;
         self.parent_misses = 0;
+        self.accepted = 0;
     }
 
+    /// A child that left the cluster: its share is ours, and its counters go.
     fn forget_child(&mut self, c: &Id) {
         for q in self.quotas.values_mut() {
-            if let Some(b) = q.children.remove(c) {
-                q.lent -= b.granted;
-                q.returning += b.granted;
+            if q.children.remove(c).is_some() {
                 self.dirty = true;
             }
         }
     }
 
+    /// Lease from `peer` from now on. The old parent is told we hold nothing from it; the
+    /// edge to the new one starts at zero, and what our children hold we ask for as need.
     fn reparent(&mut self, peer: Id) {
         self.awaiting = None;
         self.unanswered = 0;
         self.accepted = 0;
-        let now = self.now;
-        // The old parent books what we hold: tell it we hold nothing from it now. What we
-        // hold, we report to the new parent, which adopts it.
-        let keys: Vec<K> = self
+        let release: Vec<(K, u64)> = self
             .quotas
             .iter()
-            .filter(|(_, q)| q.granted > 0 || q.reported > 0)
-            .map(|(k, _)| k.clone())
+            .filter(|(_, q)| q.given > 0)
+            .map(|(k, q)| (k.clone(), q.given))
             .collect();
-        for q in self.quotas.values_mut() {
-            let gone: Vec<Id> = q
-                .children
-                .iter()
-                .filter(|(_, b)| b.expires < now)
-                .map(|(c, _)| c.clone())
-                .collect();
-            for c in gone {
-                if let Some(b) = q.children.remove(&c) {
-                    q.lent -= b.granted;
-                }
-            }
-            if q.valid_until.is_some_and(|v| now > v) && q.granted > q.lent {
-                q.granted = q.lent;
-                self.settled = now;
-            }
-        }
         if let Some(op) = self.parent.take() {
-            if !keys.is_empty() {
-                let req = self.request_for(&keys);
+            if !release.is_empty() {
+                let req = self.request_for(&release);
                 self.outbound.push(Action::Call(op, req));
             }
         }
         self.parent = Some(peer);
         self.parent_misses = 0;
-        self.seen = 0;
         for q in self.quotas.values_mut() {
-            // The new parent has given us nothing yet; what we hold is all news to it.
-            q.reported = 0;
+            q.given = 0;
+            q.returned = 0;
+            q.valid_until = None;
             q.refusals = 0;
         }
         self.call();
     }
 
-    /// A call that tells `to` we hold nothing from it: to an old parent, or for a removed
-    /// limit.
-    fn request_for(&self, keys: &[K]) -> LeaseRequest<Id, K> {
+    /// A call that hands `returned` back for each key: everything, to an old parent or for
+    /// a removed limit.
+    fn request_for(&self, release: &[(K, u64)]) -> LeaseRequest<Id, K> {
         LeaseRequest {
             term: self.term,
             leader: self.leader.clone(),
             sent: self.now,
-            seen: self.seen,
-            items: keys
+            items: release
                 .iter()
-                .map(|k| RequestItem {
+                .map(|(k, returned)| RequestItem {
                     key: k.clone(),
-                    granted: 0,
+                    given: *returned,
+                    returned: *returned,
                     needed: 0,
                     wanted: 0,
                 })
@@ -976,17 +981,16 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
     }
 
-    /// Whether it is time to call the parent: something changed, the keepalive is due, or
-    /// something is wanted and the retry has run out. A retry waits a round trip at first --
-    /// the parent may be fetching it -- and twice as long after each empty answer, up to
-    /// `ttl / 8`.
+    /// Whether it is time to call the parent: something changed, the keepalive is due, a
+    /// call went unanswered, or something is wanted and the retry has run out. A retry
+    /// waits a round trip at first -- the parent may be fetching it -- and twice as long
+    /// after each empty answer, up to `ttl / 8`.
     fn call_due(&self) -> bool {
         let now = self.now;
         if self.dirty || now >= self.last_call + self.cfg.ttl / 2 {
             return true;
         }
         let cap = Self::retry_cap(self.cfg.ttl);
-        // Unanswered: the call or its answer was lost. Send it again.
         if let Some(sent) = self.awaiting {
             let wait = (2u64 << self.unanswered.min(16)).min(cap).max(1);
             if now >= sent + wait {
@@ -1001,8 +1005,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         })
     }
 
-    /// Call the parent: every limit in play, what we hold and what we want, after handing
-    /// back what we do not use. Nothing in play: nothing on the wire.
+    /// Call the parent: every limit in play, what we returned and what we want, after
+    /// handing back what we do not use. Nothing in play: nothing on the wire.
     fn call(&mut self) {
         let Some(parent) = self.parent.clone() else {
             return;
@@ -1015,43 +1019,32 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
         let mut items = Vec::new();
         for (key, q) in self.quotas.iter_mut() {
-            let in_play = q.granted > 0 || q.reported > 0 || q.lent > 0 || q.ask() > 0;
+            let in_play = q.given > 0 || q.lent() > 0 || q.ask() > 0;
             if !in_play {
                 continue;
-            }
-            // What a child gave back was fetched for it and is the tree's, not ours: hand it
-            // back up, whatever we want ourselves, or a share that moved is used twice, here
-            // and under its new parent. If we want more, we ask like anyone.
-            if q.returning > 0 {
-                let back = q.returning.min(q.room());
-                q.granted -= back;
-                q.returning = 0;
-                if back > 0 {
-                    self.settled = now;
-                }
             }
             // While the bucket is full we are not using our share: keep one chunk beyond
             // what we lent, and never what a child is waiting for; hand back the rest.
             let full = q.tokens >= q.refill().max(1.0) * 2.0;
             if full {
                 let keep = q
-                    .lent
+                    .lent()
                     .saturating_add(q.limit.chunk)
                     .saturating_add(q.earmarked())
                     .saturating_add(q.reserved());
-                if q.granted > keep {
-                    q.granted = keep;
-                    self.settled = now;
+                if q.share() > keep {
+                    let back = q.share() - keep;
+                    q.hand_back(back);
                 }
             }
             let (need, want) = (q.need(), q.want());
             if need > 0 || want > 0 {
                 q.last_request = Some(now);
             }
-            q.reported = q.granted;
             items.push(RequestItem {
                 key: key.clone(),
-                granted: q.granted,
+                given: q.given,
+                returned: q.returned,
                 needed: need,
                 wanted: want,
             });
@@ -1063,7 +1056,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             term: self.term,
             leader: self.leader.clone(),
             sent: now,
-            seen: self.seen,
             items,
         };
         self.outbound.push(Action::Call(parent, req));
@@ -1315,7 +1307,7 @@ mod tests {
         let Action::Call(to, req) = ns[2].ready().remove(0);
         assert_eq!(to, 2);
         let resp = ns[1].on_request(3, req);
-        assert_eq!(resp.items[0].total, 0, "the middle node has nothing");
+        assert_eq!(resp.items[0].given, 0, "the middle node has nothing");
         ns[2].on_response(2, resp);
         ns[1].tick(1);
         route(&mut ns);
@@ -1442,11 +1434,18 @@ mod tests {
         ns[3].set_upstream(3);
         route(&mut ns);
         assert_eq!(ns[1].stats(&RPS).unwrap().lent, 0, "the old parent let go");
-        assert_eq!(ns[2].stats(&RPS).unwrap().lent, 2, "the new one adopted");
+        // The edge to the new parent starts at zero: the child asks it at its next
+        // write, and is leased again within a round trip or two.
+        assert_eq!(ns[3].stats(&RPS).unwrap().granted, 0);
+        for _ in 0..4 {
+            let _ = ns[3].acquire(&[(RPS, 1)]);
+            step(&mut ns);
+        }
+        assert_eq!(ns[2].stats(&RPS).unwrap().lent, 2, "the new parent lends");
         assert_eq!(
             ns[3].stats(&RPS).unwrap().granted,
             2,
-            "the child kept its share"
+            "the child is leased again"
         );
     }
 
@@ -1464,7 +1463,8 @@ mod tests {
                 sent: 0,
                 items: vec![ResponseItem {
                     key: RPS,
-                    total: 500,
+                    given: 500,
+                    returned: 0,
                 }],
             },
         );
@@ -1509,8 +1509,10 @@ mod tests {
         ns[2].set_upstream(1);
         route(&mut ns);
         assert_eq!(ns[1].stats(&RPS).unwrap().lent, 0);
-        // The middle node does not keep the 2 for itself: at its next call it hands it up.
+        // The middle node does not keep the 2 for itself: at its next call it hands it up,
+        // and the grandchild, writing on, is leased by the leader directly.
         for _ in 0..3 {
+            let _ = ns[2].acquire(&[(RPS, 1)]);
             step(&mut ns);
         }
         assert_eq!(
@@ -1598,10 +1600,10 @@ mod tests {
             term: 1,
             leader: Some(1),
             sent: 1,
-            seen: 0,
             items: vec![RequestItem {
                 key: "k",
-                granted: 0,
+                given: 0,
+                returned: 0,
                 needed: 0,
                 wanted: 10,
             }],
@@ -1712,30 +1714,34 @@ mod tests {
         l
     }
 
-    fn ask(granted: u64, wanted: u64, sent: u64) -> LeaseRequest<u32, &'static str> {
+    fn ask(needed: u64, wanted: u64, sent: u64) -> LeaseRequest<u32, &'static str> {
         LeaseRequest {
             term: 1,
             leader: Some(1),
             sent,
-            seen: sent,
             items: vec![RequestItem {
                 key: RPS,
-                granted,
-                needed: 0,
+                given: 0,
+                returned: 0,
+                needed,
                 wanted,
             }],
         }
     }
 
+    fn share(r: &LeaseResponse<u32, &'static str>) -> u64 {
+        r.items[0].given - r.items[0].returned
+    }
+
     #[test]
     fn two_children_wanting_everything_get_half_each() {
         let mut l = leader_with(75);
-        let a = l.on_request(2, ask(0, 100, 1)).items[0].total;
-        let b = l.on_request(3, ask(0, 100, 1)).items[0].total;
+        let _ = share(&l.on_request(2, ask(0, 100, 1)));
+        let _ = share(&l.on_request(3, ask(0, 100, 1)));
         // The first asker took what its level allowed before the second was known; a
         // second keepalive settles both at half, the leader's own use taking nothing.
-        let a2 = l.on_request(2, ask(a, 100, 2)).items[0].total;
-        let b2 = l.on_request(3, ask(b, 100, 2)).items[0].total;
+        let a2 = share(&l.on_request(2, ask(0, 100, 2)));
+        let b2 = share(&l.on_request(3, ask(0, 100, 2)));
         assert!(a2.abs_diff(b2) <= 1, "{a2} vs {b2}");
         assert!((74..=75).contains(&(a2 + b2)), "{a2} + {b2}");
     }
@@ -1747,47 +1753,46 @@ mod tests {
         let mut a = 0;
         let mut b = 0;
         for round in 1..4 {
-            a = l.on_request(2, ask(a, 100, round)).items[0].total;
-            b = l.on_request(3, ask(b, 100, round)).items[0].total;
+            a = share(&l.on_request(2, ask(0, 100, round)));
+            b = share(&l.on_request(3, ask(0, 100, round)));
         }
         assert_eq!((a, b), (20, 60), "one to three");
     }
 
     #[test]
-    fn an_overcommitted_root_cuts_its_children_to_their_entitlement() {
-        // After a leader change two children report holding 48 each against a limit of 75.
+    fn a_root_never_gives_more_than_it_holds_and_settles_a_fair_split() {
+        // After a leader change two children each need 48 for their subtrees, against a
+        // limit of 75. The root gives what it holds, no more, and the keepalives settle
+        // both at half.
         let mut l = leader_with(75);
-        let a0 = l.on_request(2, ask(48, 0, 1)).items[0].total;
-        let b0 = l.on_request(3, ask(48, 0, 1)).items[0].total;
-        assert!(
-            l.stats(&RPS).unwrap().lent <= 96,
-            "booked as reported, or already cut"
+        let a0 = share(&l.on_request(2, ask(48, 0, 1)));
+        let b0 = share(&l.on_request(3, ask(48, 0, 1)));
+        assert!(a0 + b0 <= 75, "{a0} + {b0}");
+        assert_eq!(
+            l.stats(&RPS).unwrap().overcommit,
+            0,
+            "a root cannot be overcommitted"
         );
-        // Their keepalives bring them down to a fair split.
-        let a = l.on_request(2, ask(a0, 0, 2)).items[0].total;
-        let b = l.on_request(3, ask(b0, 0, 2)).items[0].total;
-        assert!(a <= 38 && b <= 38, "{a} and {b}");
-        assert!(
-            l.stats(&RPS).unwrap().lent <= 75,
-            "{a} {b} {:?}",
-            l.stats(&RPS).unwrap()
-        );
-        assert_eq!(l.stats(&RPS).unwrap().overcommit, 0);
+        let a = share(&l.on_request(2, ask(48, 0, 2)));
+        let b = share(&l.on_request(3, ask(48, 0, 2)));
+        assert!(a.abs_diff(b) <= 1, "{a} vs {b}");
+        assert!((74..=75).contains(&(a + b)), "{a} + {b}");
+        assert!(l.stats(&RPS).unwrap().lent <= 75);
     }
 
     #[test]
     fn a_re_sent_request_gets_the_same_total_and_lends_nothing_more() {
         let mut l = leader_with(75);
-        let first = l.on_request(2, ask(0, 10, 1)).items[0].total;
+        let first = l.on_request(2, ask(0, 10, 1));
         let lent = l.stats(&RPS).unwrap().lent;
         // The same request again, as a retry sends it: the child has not seen the answer.
-        let again = l.on_request(2, ask(0, 10, 1)).items[0].total;
-        assert_eq!(again, first);
+        let again = l.on_request(2, ask(0, 10, 1));
+        assert_eq!(again.items, first.items);
         assert_eq!(l.stats(&RPS).unwrap().lent, lent);
     }
 
     #[test]
-    fn a_child_adopts_the_total_from_the_latest_answer_only() {
+    fn a_child_adopts_given_in_order_and_takes_the_larger_returned() {
         let mut ns = pair();
         let _ = ns[1].acquire(&[(RPS, 1)]);
         ns[1].tick(1);
@@ -1796,22 +1801,21 @@ mod tests {
         ns[1].on_response(1, resp.clone());
         let held = ns[1].stats(&RPS).unwrap().granted;
         assert!(held > 0);
-        // A cut arrives: the share follows it down.
+        // A cut arrives as a larger `returned`: the share follows it down.
         let mut cut = resp.clone();
-        cut.items[0].total = 1;
+        cut.items[0].returned = cut.items[0].given - 1;
         ns[1].on_response(1, cut);
         assert_eq!(ns[1].stats(&RPS).unwrap().granted, 1);
-        // An answer to an older request is ignored.
+        // An answer to an older request is ignored, however large.
         let mut stale = resp;
         stale.in_reply_to = 0;
-        stale.items[0].total = 500;
+        stale.items[0].given = 500;
         ns[1].on_response(1, stale);
         assert_eq!(ns[1].stats(&RPS).unwrap().granted, 1);
     }
 
     #[test]
-    fn a_node_that_adopts_more_than_it_holds_waits_a_keepalive_round_before_cutting() {
-        // A returning mid node holds nothing; its three children come back holding 2 each.
+    fn a_node_cut_below_what_it_lent_waits_a_keepalive_round_before_cutting_its_children() {
         let cfg = Config { ttl: 20 };
         let mut mid = Lease::<u32, &str>::new(2, cfg);
         mid.set_limit(
@@ -1823,39 +1827,56 @@ mod tests {
         );
         mid.set_cluster_view(Some(&[1, 2, 3, 4, 5]), 1, 1);
         mid.set_parent(1);
+        let answer = |in_reply_to: u64, given: u64, returned: u64| LeaseResponse {
+            term: 1,
+            leader: Some(1),
+            in_reply_to,
+            sent: in_reply_to,
+            items: vec![ResponseItem {
+                key: "k",
+                given,
+                returned,
+            }],
+        };
         let report = |sent: u64| LeaseRequest {
             term: 1,
             leader: Some(1),
             sent,
-            seen: sent,
             items: vec![RequestItem {
                 key: "k",
-                granted: 2,
+                given: 0,
+                returned: 0,
                 needed: 0,
-                wanted: 1,
+                wanted: 2,
             }],
         };
+        // The mid node holds 6 and lends 2 to each of three children.
         mid.tick(1);
+        mid.on_response(1, answer(1, 6, 0));
         for c in [3, 4, 5] {
-            let t = mid.on_request(c, report(1)).items[0].total;
-            assert_eq!(
-                t, 2,
-                "child {c} keeps what it holds while the mid node asks upward"
-            );
+            assert_eq!(share(&mid.on_request(c, report(1))), 2);
         }
+        assert_eq!(mid.stats(&"k").unwrap().lent, 6);
+        // Its parent cuts it to nothing. It is over by 6 and asks upward for the need.
+        mid.on_response(1, answer(2, 6, 6));
         assert_eq!(mid.stats(&"k").unwrap().overcommit, 6);
-        // At the next tick it asks its parent for the need.
         mid.tick(1);
         let Some(Action::Call(1, req)) = mid.ready().into_iter().next() else {
             panic!("the mid node asks upward");
         };
         assert!(req.items[0].needed >= 6, "{:?}", req.items[0]);
-        // Half a TTL later with nothing covered, the children are cut to a fair split of
-        // nothing.
+        // For a keepalive round the children keep what they hold.
+        for c in [3, 4, 5] {
+            assert_eq!(
+                share(&mid.on_request(c, report(3))),
+                2,
+                "child {c} keeps its share"
+            );
+        }
+        // Half a TTL later with nothing covered, they are cut to a fair split of nothing.
         mid.tick(cfg.ttl / 2);
         for c in [3, 4, 5] {
-            let t = mid.on_request(c, report(12)).items[0].total;
-            assert_eq!(t, 0, "child {c} is cut once the grace is over");
+            assert_eq!(share(&mid.on_request(c, report(14))), 0, "child {c} is cut");
         }
         assert_eq!(mid.stats(&"k").unwrap().overcommit, 0);
     }

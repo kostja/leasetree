@@ -34,18 +34,26 @@ pub struct LeaseRequest<Id, K> {
 }
 pub struct RequestItem<K> {
     pub key: K,
-    pub granted: u64,                       // what I hold from you; less than before is a release
-    pub wanted: u64,                        // what more I would take
+    pub given: u64,                         // what the child knows it was given, ever
+    pub returned: u64,                      // what it handed back, ever
+    pub needed: u64,                        // lent beyond its share: a moved subtree, a cut
+    pub wanted: u64,                        // what more it would take
+}
+pub struct LeaseRequest<Id, K> {
+    pub term: u64, pub leader: Option<Id>,  // the child's view; a stale parent learns from it
+    pub sent: u64,                          // the child's tick; the share is dated from it
+    pub items: Vec<RequestItem<K>>,
 }
 pub struct LeaseResponse<Id, K> {
     pub term: u64, pub leader: Option<Id>,  // the parent's view; a stale child learns from it
-    pub in_reply_to: u64,                   // the request's `sent`
-    pub sent: u64,                          // the parent's tick, echoed back as `seen`
+    pub in_reply_to: u64,                   // the request's `sent`; answers apply in this order
+    pub sent: u64,                          // the parent's tick, for the log
     pub items: Vec<ResponseItem<K>>,
 }
 pub struct ResponseItem<K> {
     pub key: K,
-    pub total: u64,                         // your share now: a total, not a delta
+    pub given: u64,                         // what the parent handed the child, ever
+    pub returned: u64,                      // what it counts as handed back, ever: returns and cuts
 }
 ```
 
@@ -56,15 +64,16 @@ call that goes unanswered is sent again on the same backoff, keepalive or not: o
 lost keepalive would let the share lapse, since the next keepalive's answer lands one tick
 after the share's validity ends.
 
-`wanted` is what the child would take. The parent answers with the child's share as a total,
-its entitlement in the split below; what it could not give it remembers for this child and
-asks its own parent for, and what it fetches for a waiting child it never hands back as spare.
-A total is idempotent: a re-sent request gets the same answer and lends nothing more, and
-a total below what the child holds is a cut, which the child adopts. The child adopts only the
-answer to its latest request. A release is a smaller `granted`; a node that moved tells its
-old parent `granted: 0`. A parent books what the child reports, and `seen` lets it tell, on
-its own clock, whether a report was sent before its last answer arrived, in which case its own
-booking stands; no clock is ever compared across nodes.
+Each edge carries two counters that only grow: `given`, what the parent handed the child,
+ever; `returned`, what the child handed back, ever. The share is the difference. The parent
+merges the child's `returned` by max; the child adopts the parent's `given` from answers in
+order and takes the larger `returned`. So a re-sent request gets the same answer and lends
+nothing more, a lost answer is healed by the next one, a restarted parent's answers bring the
+child down to what the new incarnation gave, and a cut is a `returned` the parent raised. The
+child says what `given` it knows of, so a want made before an answer arrived is read against
+the share the parent already gave. A release raises `returned`; a node that moved raises it to
+`given` for its old parent and starts the new edge at zero. No clock is ever compared across
+nodes.
 
 ### The rules
 
