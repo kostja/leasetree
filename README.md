@@ -135,9 +135,28 @@ the parent sent, not what the child reports, left a stale booking behind every l
 every move, a quarter of the shares in one simulator run. The cost is one call per node per
 `ttl / 2` when idle, more only while something changes, and none at all with nothing in play.
 
+**A node without a good lease asks for one, whatever the kind decides about the write.**
+"Good" is confirmed in the current term and not lapsed. What happens to the write meanwhile
+is the kind's decision: a stock refuses, a rate admits. What happens to the lease is not: in
+both cases the node marks the limit wanted, and its next call asks. A rate admits without a
+lease so that a node is never stalled by the lease system, a leader change or a dead parent
+costing a round trip or two. But that is safe only as a transient: the cluster's rate is the
+sum of the shares held, and an unleased node is outside it. Without the rule nothing would
+make such a node ask, since for a rate no write is ever refused, and it would stay outside
+the limit for good. Node C has a rate of 2 per tick and no lease:
+
+| tick | without the rule | with the rule |
+|---|---|---|
+| 1 | admitted, unleased; nothing asked | admitted, unleased; C calls with `wanted: 2` |
+| 3 | admitted, unleased | leased at 2; admitted against the bucket |
+| 100 | still admitted, still unleased | throttled at 2 per tick like everyone |
+
+In the simulator, ten of two hundred nodes ran unlimited for a whole run before this rule,
+and no table showed it, because a rate's overshoot is not what the tables measure. The cost
+is one call, and then the ordinary lease.
+
 The remaining rules, in short:
 
-- A node without a good lease asks for one, whatever the kind decides about the write.
 - A node that moves to a new parent tells the old one it holds nothing from it, but only once
   the new parent has answered; until then both book it and nobody re-lends it.
 - A parent that booked more than it holds cuts a stock only after a grace period, never below
