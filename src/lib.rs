@@ -72,6 +72,9 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The tree as a pure function of a cluster view.
+pub mod tree;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Timing, in ticks. The caller decides what a tick is, and drives [`tick`](Lease::tick)

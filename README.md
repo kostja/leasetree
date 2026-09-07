@@ -125,7 +125,7 @@ told, and it does not care from where:
 | `set_limit(key, Limit)`, `remove_limit(&key)` | the quota configuration | at boot and on change |
 | `set_cluster_view(members, leader, term)` | Raft's system tables | on every change; `members` may be omitted |
 | `set_upstream(peer)` | the overlay | whenever the leader's traffic is delivered, with the peer that delivered it |
-| `set_parent(peer)` | a tree computed from the cluster view | whenever the view changes; switches at once, no hysteresis |
+| `set_parent(peer)` | [`tree::place`](#the-tree-from-the-view) | whenever the view changes; switches at once, no hysteresis |
 | `down(peers)`, `up(peers)` | the failure detector | on its verdicts |
 | `on_request(from, LeaseRequest) -> LeaseResponse` | the RPC handler | on a child's call; returns the answer to send |
 | `on_response(from, LeaseResponse)` | the RPC client | on the parent's answer |
@@ -203,6 +203,21 @@ lapses everything at once.
 With a tick of 100 ms, `ttl: 40` is a four-second share, renewed every two seconds. A node
 whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks,
 admitting everything meanwhile.
+
+## The tree from the view
+
+Where membership, liveness and the leader are replicated facts every node learns the same
+way -- a Raft cluster's system tables, say -- no overlay is needed to agree on the tree.
+`tree::place(me, leader, members, fan_in)` computes one node's place from the view: the leader
+is the root; in every other failure domain the lowest id is the gateway and hangs under the
+leader, so a domain is entered once; inside a domain the rest, by id, is a heap with fan-in
+`fan_in`. Feed the result to `set_parent` whenever the view changes. Every node computes the
+same tree from the same view, at its own wall-clock time; the lease machine tolerates the
+moments in between, since a parent books whoever asks.
+
+Only the view moves the tree. A child whose parent is dead but not yet reported so keeps
+calling with backoff, its share lapses after one TTL, and it admits without one, asking,
+until the view changes. That interval is the failure detector's delay plus one TTL.
 
 ## References
 
