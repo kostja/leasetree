@@ -431,6 +431,24 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
+    /// The parent is known exactly -- computed from a cluster view every node shares, say --
+    /// so take `peer` as parent now, with none of [`set_upstream`](Lease::set_upstream)'s
+    /// hysteresis. A peer that was our child stops being one first, so a reordering that
+    /// swaps a parent and a child cannot make a cycle. Nothing to do for the leader, for
+    /// ourselves, or for the parent we already have.
+    pub fn set_parent(&mut self, peer: Id) -> bool {
+        let was_empty = self.outbound.is_empty();
+        if self.is_leader() || peer == self.me || self.parent.as_ref() == Some(&peer) {
+            self.parent_misses = 0;
+            return false;
+        }
+        if self.children().any(|c| *c == peer) {
+            self.forget_child(&peer);
+        }
+        self.reparent(peer);
+        self.woke(was_empty)
+    }
+
     /// `peers` are unreachable. A child among them is lapsed at once; a parent among them is
     /// left, and the next delivery picks a new one.
     pub fn down(&mut self, peers: &[Id]) -> bool {
@@ -1375,5 +1393,45 @@ mod tests {
             })
             .sum();
         assert!(refills <= 6, "the rate is not over-allocated: {refills}");
+    }
+
+    #[test]
+    fn set_parent_switches_at_once_and_unbooks_a_child_that_becomes_the_parent() {
+        let cfg = Config { ttl: 40 };
+        let mut n = Lease::<u32, &str>::new(2, cfg);
+        n.set_limit(
+            "k",
+            Limit {
+                limit: 100,
+                chunk: 10,
+            },
+        );
+        n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        // Node 3 leases from 2, so it is 2's child.
+        let req = LeaseRequest {
+            term: 1,
+            leader: Some(1),
+            sent: 1,
+            seen: 0,
+            items: vec![RequestItem {
+                key: "k",
+                granted: 0,
+                needed: 0,
+                wanted: 10,
+            }],
+        };
+        n.on_request(3, req);
+        assert!(n.children().any(|c| *c == 3));
+        // `set_upstream` would wait for a second signal; `set_parent` does not.
+        n.set_parent(1);
+        assert_eq!(n.parent(), Some(&1));
+        n.set_parent(3); // a reorder makes the child the parent
+        assert_eq!(n.parent(), Some(&3));
+        assert!(
+            !n.children().any(|c| *c == 3),
+            "no longer our child: no cycle"
+        );
+        n.set_parent(3);
+        assert_eq!(n.parent(), Some(&3), "already the parent: unchanged");
     }
 }

@@ -125,6 +125,7 @@ told, and it does not care from where:
 | `set_limit(key, Limit)`, `remove_limit(&key)` | the quota configuration | at boot and on change |
 | `set_cluster_view(members, leader, term)` | Raft's system tables | on every change; `members` may be omitted |
 | `set_upstream(peer)` | the overlay | whenever the leader's traffic is delivered, with the peer that delivered it |
+| `set_parent(peer)` | a tree computed from the cluster view | whenever the view changes; switches at once, no hysteresis |
 | `down(peers)`, `up(peers)` | the failure detector | on its verdicts |
 | `on_request(from, LeaseRequest) -> LeaseResponse` | the RPC handler | on a child's call; returns the answer to send |
 | `on_response(from, LeaseResponse)` | the RPC client | on the parent's answer |
