@@ -66,16 +66,21 @@ pub struct ResponseItem<K> {
     pub key: K,
     pub grant: u64,                         // this much more is yours
     pub hold: u64,                          // all I book for you; less than you hold is a cut
-    pub pending: bool,                      // I am asking upward for the rest; ask again soon
 }
 ```
 
-A child calls every `ttl / 2` as a keepalive, at once when what it holds, wants or covers
-changed or its term did, and every round trip while the parent said `pending`. A release is a
-smaller `granted`; a node that moved tells its old parent `granted: 0`. A cut is a `hold`
-below what the child holds; the child gives back what it has not spent, and what its own
-children hold they learn of in their next answers. Reporting is a stock's business: `usage`
-is empty for a rate, and empty means no news.
+A child calls every `ttl / 2` as a keepalive, and at once when what it holds, wants or covers
+changed or its term did. While it wants something it also retries: after a round trip at
+first, since the parent may be fetching it, then twice as long after each empty answer, up
+to `ttl / 8`, so an exhausted quota is not polled hard.
+
+`wanted` is what the child would take. The parent gives what it has, remembers the rest for
+this child and asks its own parent for it, and what it fetches for a waiting child it never
+hands back as spare; the child finds it on its retry. A release is a smaller `granted`; a
+node that moved tells its old parent `granted: 0`. A cut is a `hold` below what the child
+holds; the child gives back what it has not spent, and what its own children hold they learn
+of in their next answers. Reporting is a stock's business: `usage` is empty for a rate, and
+empty means no news.
 
 ### The rules
 
@@ -132,9 +137,6 @@ every move, a quarter of the shares in one simulator run. The cost is one call p
 
 The remaining rules, in short:
 
-- A parent that cannot fill a request books the child anyway, asks its own parent for the
-  shortfall at once, keeps that much earmarked, and says so in its answer, so the child asks
-  again after a round trip rather than after the retry period.
 - A node without a good lease asks for one, whatever the kind decides about the write.
 - A node that moves to a new parent tells the old one it holds nothing from it, but only once
   the new parent has answered; until then both book it and nobody re-lends it.
@@ -231,7 +233,7 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 |---|---|
 | `ttl` | how long a lease is good without renewal; default 40 |
 | keepalive call | every `ttl / 2` |
-| ask again for what is wanted | after `ttl / 8`, or a round trip while the parent said `pending` |
+| ask again for what is wanted | after a round trip, doubling after each empty answer, up to `ttl / 8` |
 | cut a child, once over-committed for | `ttl / 8` |
 | leave a parent | after it missed two deliveries of the leader's traffic |
 | a new leader's fallback window | `ttl` |

@@ -30,11 +30,13 @@
 //!
 //! The whole protocol is one RPC from a child to its parent: a [`LeaseRequest`] answered by a
 //! [`LeaseResponse`]. The child calls every `ttl / 2`, at once when what it holds, wants or
-//! covers changed, and every round trip while the parent said it was still asking upward. A
-//! request reports, per limit, what the child holds from the parent (less than before is a
-//! release), what more it wants, and, for a stock, the usage map of its subtree. A response
-//! grants, tells the child all the parent books for it (less than it holds is a cut), and
-//! whether the parent is still asking upward on its behalf. The parent never calls the child.
+//! covers changed, and while it wants something: after a round trip at first, then twice as
+//! long after each empty answer, up to `ttl / 8`. A request reports, per limit, what the
+//! child holds from the parent (less than before is a release), what more it wants, and, for
+//! a stock, the usage map of its subtree. A response grants, and tells the child all the
+//! parent books for it (less than it holds is a cut). The parent gives what it has, remembers
+//! the rest for this child and asks its own parent for it, and what it fetches for a waiting
+//! child it never hands back as spare. The parent never calls the child.
 //!
 //! # The contract
 //!
@@ -65,9 +67,6 @@
 //!   (dated from arrival, later) never re-lends room the child still considers its own.
 //! - A child calls whenever what it holds, wants or covers changed, or its term did, and
 //!   every `ttl / 2` as a keepalive. A parent books what the child reports.
-//! - A parent that cannot fill a request books the child anyway, asks its own parent for the
-//!   shortfall at once, keeps that much earmarked, and says so in its answer, so the child
-//!   asks again after a round trip rather than after the retry period.
 //! - A node without a good lease asks for one whatever the kind decides about the write.
 //! - A node that moves to a new parent reports to the old one that it holds nothing from it,
 //!   but only once the new parent has confirmed the adoption; until then both book it and
@@ -188,9 +187,6 @@ pub struct ResponseItem<K> {
     pub grant: u64,
     /// All the parent books for the child. Less than the child holds is a cut.
     pub hold: u64,
-    /// The parent could not fill the request and is asking upward: ask again after a round
-    /// trip, not after the retry period.
-    pub pending: bool,
 }
 
 /// parent -> child: the answer. A stale leader learns of its successor from `term` on the
@@ -278,10 +274,9 @@ struct Quota<Id: Ord + Clone> {
     /// more, even to zero.
     reported: u64,
     last_request: Option<u64>,
-    /// Our parent said it is asking upward for us: ask again after a round trip.
-    pending: bool,
-    /// We are asking upward for a child and have not been refused: say so to the children.
-    asking: bool,
+    /// Asks answered with nothing, in a row: the next one waits twice as long, up to
+    /// `ttl / 8`.
+    refusals: u32,
     /// Since when we have lent more than we hold.
     over_since: Option<u64>,
 }
@@ -299,8 +294,7 @@ impl<Id: Ord + Clone> Quota<Id> {
             wanted: 0,
             reported: 0,
             last_request: None,
-            pending: false,
-            asking: false,
+            refusals: 0,
             over_since: None,
         }
     }
@@ -585,9 +579,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                     q.last_request = None;
                 }
                 q.wanted = q.wanted.max(short);
-                q.asking = true;
             }
-            let pending = short > 0 && q.asking;
             let overcommit = q.overcommit();
             let is_stock = q.limit.is_stock();
             let b = q.children.entry(from.clone()).or_insert(Booking {
@@ -620,7 +612,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 key: it.key,
                 grant: give,
                 hold,
-                pending,
             });
         }
         // A child that holds nothing and wants nothing of any limit is no longer a child.
@@ -664,14 +655,12 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             if it.grant > 0 {
                 q.reported += it.grant;
                 q.wanted = q.wanted.saturating_sub(it.grant);
+                q.refusals = 0;
+            } else if q.wanted > 0 {
+                q.refusals = q.refusals.saturating_add(1);
             }
             q.term = q.term.max(resp.term);
             q.valid_until = q.valid_until.max(resp.in_reply_to + ttl);
-            q.pending = it.pending;
-            if !it.pending && it.grant == 0 {
-                // Refused outright: our children hear that in their next answers.
-                q.asking = false;
-            }
             if q.cut_to(it.hold) {
                 self.dirty = true;
             }
@@ -875,8 +864,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         q.term = term;
         q.valid_until = u64::MAX;
         q.wanted = 0;
-        q.pending = false;
-        q.asking = false;
+        q.refusals = 0;
     }
 
     /// Become the leader: hold every limit outright, and let the old parent go.
@@ -981,7 +969,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         for q in self.quotas.values_mut() {
             // The new parent has given us nothing yet; what we hold is all news to it.
             q.reported = 0;
-            q.pending = false;
+            q.refusals = 0;
         }
         self.call();
     }
@@ -1030,17 +1018,20 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     /// Whether it is time to call the parent: something changed, the keepalive is due, or
-    /// something is wanted and the retry has run out (a round trip while the parent is asking
-    /// upward for us, `ttl / 8` otherwise).
+    /// something is wanted and the retry has run out. A retry waits a round trip at first --
+    /// the parent may be fetching it -- and twice as long after each empty answer, up to
+    /// `ttl / 8`.
     fn call_due(&self) -> bool {
         let now = self.now;
         if self.dirty || now >= self.last_call + self.cfg.ttl / 2 {
             return true;
         }
-        let retry = Self::grace(self.cfg.ttl);
+        let cap = Self::grace(self.cfg.ttl);
         self.quotas.values().any(|q| {
             let want = q.wanted.max(q.overcommit());
-            let wait = if q.pending { 2 } else { retry };
+            let wait = (2u64 << q.refusals.saturating_sub(1).min(16))
+                .min(cap)
+                .max(1);
             want > 0 && q.last_request.map_or(true, |t| now >= t + wait)
         })
     }
@@ -1086,7 +1077,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let want = q.wanted.max(q.overcommit());
             if want > 0 {
                 q.last_request = Some(now);
-                q.asking = true;
             }
             q.reported = q.cap.granted();
             items.push(RequestItem {
@@ -1416,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shortfall_is_forwarded_and_the_child_told_to_ask_again_soon() {
+    fn a_shortfall_is_fetched_by_the_parent_and_found_on_the_child_s_retry() {
         let mut ns = vec![node(1), node(2), node(3)];
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
@@ -1426,20 +1416,46 @@ mod tests {
         route(&mut ns);
         let _ = ns[2].acquire(&[(BYTES, 10)]);
         ns[2].tick(1);
-        // The child's call reaches the middle node, which has nothing and says so.
+        // The child's call reaches the middle node, which has nothing and gives nothing.
         let Action::Call(to, req) = ns[2].ready().remove(0);
         assert_eq!(to, 2);
         let resp = ns[1].on_request(3, req);
-        assert!(resp.items[0].pending, "the middle node is asking upward");
         assert_eq!(resp.items[0].grant, 0);
         ns[2].on_response(2, resp);
-        // The middle node asks the leader at its next tick; the child asks again after a
-        // round trip and gets the chunk the middle node fetched for it.
+        // The middle node asks the leader at its next tick; the child retries after a round
+        // trip and finds the chunk the middle node fetched for it.
         ns[1].tick(1);
         route(&mut ns);
         ns[2].tick(2);
         route(&mut ns);
         assert_eq!(ns[2].stats(&BYTES).unwrap().granted, 100);
+    }
+
+    #[test]
+    fn a_refused_ask_backs_off_up_to_ttl_over_eight() {
+        let mut l = node(1);
+        l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        l.acquire(&[(BYTES, 1000)]).unwrap(); // the quota is exhausted
+        let mut c = node(2);
+        c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.set_upstream(1);
+        let _ = c.acquire(&[(BYTES, 10)]);
+        let mut asked_at = Vec::new();
+        for t in 1..=40 {
+            c.tick(1);
+            for Action::Call(_, req) in c.ready() {
+                if req.items.iter().any(|i| i.wanted > 0) {
+                    asked_at.push(t);
+                }
+                let resp = l.on_request(2, req);
+                c.on_response(1, resp);
+            }
+        }
+        // Gaps of 2, 4, 5, 5, ...: a round trip, doubled, capped at ttl / 8 = 5. The
+        // keepalive at ttl / 2 carries the want too, so a shorter gap appears there.
+        let gaps: Vec<u64> = asked_at.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(&gaps[..3], &[2, 4, 5], "{gaps:?}");
+        assert!(gaps[3..].iter().all(|&g| g <= 5), "{gaps:?}");
     }
 
     #[test]
