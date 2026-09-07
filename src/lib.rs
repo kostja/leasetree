@@ -769,6 +769,16 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.woke(was_empty)
     }
 
+    /// Call the parent now if a call is due, without moving the clock: after an `acquire`
+    /// that put a key in play, so the ask does not wait for the next tick.
+    pub fn poke(&mut self) -> bool {
+        let was_empty = self.outbound.is_empty();
+        if !self.is_leader() && self.parent.is_some() && self.call_due() {
+            self.call();
+        }
+        self.woke(was_empty)
+    }
+
     /// Drain the outbound queue, in FIFO order.
     #[must_use]
     pub fn ready(&mut self) -> Vec<Action<Id, K>> {
