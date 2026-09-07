@@ -208,12 +208,20 @@ admitting everything meanwhile.
 
 Where membership, liveness and the leader are replicated facts every node learns the same
 way -- a Raft cluster's system tables, say -- no overlay is needed to agree on the tree.
-`tree::place(me, leader, members, fan_in)` computes one node's place from the view: the leader
-is the root; in every other failure domain the lowest id is the gateway and hangs under the
-leader, so a domain is entered once; inside a domain the rest, by id, is a heap with fan-in
-`fan_in`. Feed the result to `set_parent` whenever the view changes. Every node computes the
-same tree from the same view, at its own wall-clock time; the lease machine tolerates the
-moments in between, since a parent books whoever asks.
+`tree::place(me, leader, members, radix)` computes one node's place from the view, and every
+node computes the same tree from the same view, at its own wall-clock time. Feed the result
+to `set_parent` whenever the view changes; the lease machine tolerates the moments in
+between, since a parent books whoever asks.
+
+The rule is a trie over the ids themselves, so a node's position depends on its id alone and
+a change moves as few nodes as possible. Inside a failure domain, a node's parent is its id
+with the lowest nonzero base-`radix` digit cleared, climbing past ids that are not present;
+an id with no present ancestor hangs under the domain's lowest id, the domain's root. The
+domain roots hang under the leader. In the leader's own domain the path from the leader up to
+the root flips direction, and nothing else moves. So a leader change moves the gateways and
+one path of about `log` nodes; a node leaving moves only its children; a node joining lands
+at its own place. With radix 4 and two hundred nodes the tree is at most six deep and the
+root has at most sixteen children.
 
 Only the view moves the tree. A child whose parent is dead but not yet reported so keeps
 calling with backoff, its share lapses after one TTL, and it admits without one, asking,
