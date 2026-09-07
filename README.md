@@ -155,10 +155,33 @@ In the simulator, ten of two hundred nodes ran unlimited for a whole run before 
 and no table showed it, because a rate's overshoot is not what the tables measure. The cost
 is one call, and then the ordinary lease.
 
+**A node that moves tells its old parent it holds nothing from it, but only once the new
+parent has answered.** A move has two halves, adoption by the new parent and release by the
+old, and the rule fixes the order: adoption first, and only the new parent's answer counts as
+adoption. In between, the lease is booked by both parents, on purpose: double-booked room is
+room nobody can lend. Releasing first would free the room at the old parent before anyone
+had booked the lease, and a lease booked nowhere can be spent twice. C holds 100 from P and
+moves to P2, one tick of latency:
+
+| tick | C | P books | P2 books |
+|---|---|---|---|
+| 14 | calls P2 with `granted: 100` | 100 | 0 |
+| 15 | P2 receives it | 100 | 100 |
+| 16 | P2's answer arrives; C now tells P `granted: 0` | 100 | 100 |
+| 17 | P receives it | 0 | 100 |
+
+The step itself is not needed for safety: the old booking would lapse at `ttl` on its own.
+It is there for the room it frees: without it every moved lease is stranded at its old
+parent for up to a TTL, and a leader change moves most leases. In the simulator, at N=200 and
+TTL 40, a leader change refused five times as many writes without it (5534 against 1089) and
+the new leader took 35 ticks instead of 14 to see the true total. If the new parent's answer
+never comes, the old parent is never told, the booking lapses at `ttl`, and the lease is
+unspendable meanwhile: a false denial, never an overshoot. An answer from anyone but the
+current parent carries only the term. The double booking is what the simulator's
+`overbooked` column shows during a leader change.
+
 The remaining rules, in short:
 
-- A node that moves to a new parent tells the old one it holds nothing from it, but only once
-  the new parent has answered; until then both book it and nobody re-lends it.
 - A parent that booked more than it holds cuts a stock only after a grace period, never below
   what the child's subtree has used; the child gives back what it can and its own children
   learn the rest in their next answers. A rate is never cut.
