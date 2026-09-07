@@ -1,9 +1,11 @@
 # leasetree
 
 A pure state machine for distributed rate limits. No IO, no clock. You feed it events; it
-returns calls to make. It sits beside [`plumtree-fsm`](https://github.com/kostja/plumtree),
-whose spanning tree it follows: plumtree is the overlay, leasetree is the protocol that hands
-shares of a rate down that tree.
+returns calls to make. Shares of a rate are handed down a tree rooted at the cluster's
+leader; the tree is a pure function of the cluster view (`tree::place`), so every node
+computes it alone and no overlay is needed to agree on it. An overlay such as
+[`plumtree-fsm`](https://github.com/kostja/plumtree) can drive the parent choice instead
+(`set_upstream`) where the view is not a shared fact.
 
 ## How it works
 
@@ -96,12 +98,20 @@ held it. Each node compares only its own clock with itself, so skew does not mat
 matters is that a node's clock never steps back. This is the lease discipline of Chubby and
 GFS.
 
-**A child calls on change, and every `ttl / 2` regardless; a parent books what the child
-reports.** The keepalive is time-driven: with no news, a child still calls every `ttl / 2`, so
-one lost call does not lapse its share. Everything else is change-driven, at the next tick:
-what the node holds changed, what it wants changed, or its term did. And the parent's booking
-is what the child says it holds, not what the parent sent: a grant that never arrived, a share
-handed back, a share adopted from another parent, all reconcile on the next call.
+**A child calls on change, and every `ttl / 2` regardless; a call is retried until answered.**
+The keepalive is time-driven: with no news, a child still calls every `ttl / 2`. Everything
+else is change-driven, at the next tick: what the node holds changed, what it wants changed,
+or its term did. A call that goes unanswered is sent again on the ask's backoff, keepalive or
+not, or one lost keepalive would lapse the share.
+
+**Every edge is two counters that only grow, and the share is their difference.** `given`
+is the parent's, `returned` the child's; the parent merges the child's `returned` by max, the
+child adopts the parent's `given` from answers in order and takes the larger `returned`. A
+gift raises `given`; a return, a lapse, or a cut raises `returned`. Nothing is ever claimed:
+a child cannot say what it holds, only what it gave back, so a parent can never book more
+than it gave, and a root cannot be overcommitted. A re-sent request gets the same answer, a
+lost answer is healed by the next, a restarted parent brings its children down to what it
+gave. This is the arithmetic of an escrow counter, between two nodes, without the gossip.
 
 **A parent splits its share among its claimants by weighted max-min fairness.** The claimants
 are its children and itself. A child's demand is what it holds and wants, as reported; its
@@ -129,22 +139,26 @@ rate of 2 per tick and no share:
 | 3 | admitted, unleased | leased at 2; admitted against the bucket |
 | 100 | still admitted, still unleased | throttled at 2 per tick like everyone |
 
-**A node's parent is the peer the overlay delivers the leader's traffic through; it moves to
-a new deliverer once that peer has delivered twice in a row, and never to its own child.**
-The lease tree has no shape of its own. It follows the overlay's tree rooted at the leader and
-follows its changes: when plumtree swaps a link for a cheaper one, the deliverer changes for
-good, and two deliveries later so does the parent, with one release and one adoption. What it
-does not follow is a single detour, a lost copy fetched from a lazy peer. Measured in the
-simulator at N=200: with no loss, every node's parent is the peer the overlay delivers through;
-at 5% loss, about nine in ten, the rest inside the two-delivery lag of a swap in progress. So
-the lease tree is as local to a data centre as the overlay is. The own-child refusal is for the
-turn-around after a leader change, so that two nodes never book each other's shares in a loop.
-A node whose parent was the old leader takes the first upstream it is offered, since Raft has
+**A node's parent is its place in the tree the view defines, and only the view moves it.**
+`tree::place` names the parent; `set_parent` takes it at once. A child whose parent is dead
+but not yet reported so keeps calling with backoff, its share lapses after one TTL, and it
+admits without one, asking, until the view changes: the failure detector's delay plus one
+TTL, and no longer. A node that moves hands everything back to its old parent, starts the new
+edge at zero, and is shareless for one round trip; what its own children hold it asks for as
+need. A node whose parent was the old leader takes the new one's tree at once, since Raft has
 just told it that leader is gone.
+
+Where the view is not a shared fact, an overlay can name the parent instead: `set_upstream`
+takes the peer that delivered the leader's traffic, and moves to a new one only after it
+delivered twice in a row, and never to its own child. The tree is then as local as the
+overlay is.
 
 A leader change costs nothing else: the new leader holds the rate at once, and every node that
 holds a share calls its parent when Raft shows the new term, so the new tree books what it
-holds. A deposed leader steps down on the first call it receives with the newer term.
+holds. A deposed leader steps down on the first call it receives with the newer term. A node
+over its own share -- cut from above, or holding children that hold more than it does -- waits
+one keepalive round before cutting them, since its own ask upward may cover it; a root cuts
+at once.
 
 ## What the caller supplies
 
@@ -155,8 +169,9 @@ told, and it does not care from where:
 |---|---|---|
 | `set_limit(key, Limit)`, `remove_limit(&key)` | the quota configuration | at boot and on change |
 | `set_cluster_view(members, leader, term)` | Raft's system tables | on every change; `members` may be omitted |
-| `set_upstream(peer)` | the overlay | whenever the leader's traffic is delivered, with the peer that delivered it |
 | `set_parent(peer)` | [`tree::place`](#the-tree-from-the-view) | whenever the view changes; switches at once, no hysteresis |
+| `set_weights(&[(child, subtree size)])` | `tree::weights` | with `set_parent`: the split among children is by subtree size |
+| `set_upstream(peer)` | an overlay, instead of the two above | whenever the leader's traffic is delivered, with the peer that delivered it |
 | `down(peers)`, `up(peers)` | the failure detector | on its verdicts |
 | `on_request(from, LeaseRequest) -> LeaseResponse` | the RPC handler | on a child's call; returns the answer to send |
 | `on_response(from, LeaseResponse)` | the RPC client | on the parent's answer |
@@ -169,7 +184,7 @@ answer instead; the handler sends it back.
 ## Driving it
 
 ```rust,ignore
-use leasetree::{Lease, Config, Limit, Action};
+use leasetree::{tree, Lease, Config, Limit, Action};
 
 // Boot: the limits from configuration, the view from Raft.
 let mut lease = Lease::new(my_raft_id, Config { ttl: 40 });
@@ -178,12 +193,13 @@ for row in quota_table {
 }
 lease.set_cluster_view(Some(&instances), leader, term);
 
-// On every system-table change.
+// On every system-table change: the view, and this node's place in the tree it defines.
 wake_if(lease.set_cluster_view(Some(&instances), leader, term));
-
-// The leader sends something over the overlay now and then; every delivery of it tells a
-// node which peer is upstream.
-wake_if(lease.set_upstream(deliverer));
+let members: Vec<(Id, Domain)> = online_instances_with_failure_domains();
+lease.set_weights(&tree::weights(&my_raft_id, &leader, &members, 4));
+if let Some(tree::Place::Under(parent)) = tree::place(&my_raft_id, &leader, &members, 4) {
+    wake_if(lease.set_parent(parent));
+}
 
 // The failure detector.
 wake_if(lease.down(&dead)); wake_if(lease.up(&back));
@@ -208,7 +224,8 @@ match lease.acquire(&[(user_rps, 1), (bucket_bps, bytes)]) {
 ```
 
 `acquire` is local and never calls. A refusal marks the limit wanted, and the next `tick`
-asks, so the request path has no network side effects. `stats(&key)` has the figures for
+asks; `poke` asks now, for a caller that would rather not wait a tick on the first request
+of a key. The request path has no network side effects. `stats(&key)` has the figures for
 metrics: the share, what is lent, what is wanted, the bucket.
 
 A complete driver, with a surrogate network, Raft's view arriving late, a failure detector, a
@@ -223,8 +240,10 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 |---|---|
 | `ttl` | how long a share is good without renewal; default 40 |
 | keepalive call | every `ttl / 2` |
-| ask again for what is wanted | after a round trip, doubling after each empty answer, up to `ttl / 8` |
-| leave a parent | after it missed two deliveries of the leader's traffic |
+| ask again for what is wanted, or an unanswered call | after a round trip, doubling after each empty answer, up to `ttl / 8` |
+| cut a child that is over its entitlement | past one chunk; past anything while over one's own share, after a keepalive round of grace |
+| `Limit::chunk` | the ask size, and the split's hysteresis: size it below a node's fair share, or the error is a chunk per child |
+| leave a parent (`set_upstream` only) | after it missed two deliveries of the leader's traffic |
 | `Limit::burst` | the bucket's capacity on a node, in units, when two ticks of its share are less; at least one request, or a share below a request per tick never serves one |
 
 Drive `tick` from a **monotonic clock**, never wall time. A node compares only its own clock
@@ -233,7 +252,7 @@ spendable for as long as it stepped. A pause or a forward jump is fine: a large 
 lapses everything at once.
 
 With a tick of 100 ms, `ttl: 40` is a four-second share, renewed every two seconds. A node
-whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks,
+whose parent dies re-parents when the view says so and is re-leased within a few ticks,
 admitting everything meanwhile.
 
 ## The tree from the view
