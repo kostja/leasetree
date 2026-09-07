@@ -856,6 +856,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         out.into_iter()
     }
 
+    /// The limits configured on this node.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.quotas.keys()
+    }
+
     /// One limit as this node sees it.
     pub fn stats(&self, key: &K) -> Option<Stats> {
         let q = self.quotas.get(key)?;
