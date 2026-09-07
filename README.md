@@ -51,7 +51,10 @@ pub struct ResponseItem<K> {
 
 A child calls every `ttl / 2` as a keepalive, and at once when what it holds or wants changed
 or its term did. While it wants something it also retries: after a round trip at first, since
-the parent may be fetching it, then twice as long after each empty answer, up to `ttl / 8`.
+the parent may be fetching it, then twice as long after each empty answer, up to `ttl / 8`. A
+call that goes unanswered is sent again on the same backoff, keepalive or not: otherwise one
+lost keepalive would let the share lapse, since the next keepalive's answer lands one tick
+after the share's validity ends.
 
 `wanted` is what the child would take. The parent gives what it has, remembers the rest for
 this child and asks its own parent for it, and what it fetches for a waiting child it never

@@ -306,6 +306,11 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     /// Something changed since the last call: call at the next tick.
     dirty: bool,
     last_call: u64,
+    /// The `sent` of the last call the parent has not answered, and how many times it has
+    /// been re-sent: a call is retried until answered, keepalive or not, or one lost
+    /// keepalive would lapse the share.
+    awaiting: Option<u64>,
+    unanswered: u32,
     outbound: Vec<Action<Id, K>>,
 }
 
@@ -326,6 +331,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             seen: 0,
             dirty: false,
             last_call: 0,
+            awaiting: None,
+            unanswered: 0,
             outbound: Vec::new(),
         }
     }
@@ -581,6 +588,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
         let ttl = self.cfg.ttl;
         self.seen = self.seen.max(resp.sent);
+        if self.awaiting.is_some_and(|sent| resp.in_reply_to >= sent) {
+            self.awaiting = None;
+            self.unanswered = 0;
+        }
         for it in resp.items {
             let Some(q) = self.quotas.get_mut(&it.key) else {
                 continue;
@@ -798,6 +809,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     fn reparent(&mut self, peer: Id) {
+        self.awaiting = None;
+        self.unanswered = 0;
         let now = self.now;
         // The old parent books what we hold: tell it we hold nothing from it now. What we
         // hold, we report to the new parent, which adopts it.
@@ -870,6 +883,13 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             return true;
         }
         let cap = Self::retry_cap(self.cfg.ttl);
+        // Unanswered: the call or its answer was lost. Send it again.
+        if let Some(sent) = self.awaiting {
+            let wait = (2u64 << self.unanswered.min(16)).min(cap).max(1);
+            if now >= sent + wait {
+                return true;
+            }
+        }
         self.quotas.values().any(|q| {
             let wait = (2u64 << q.refusals.saturating_sub(1).min(16))
                 .min(cap)
@@ -887,6 +907,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let now = self.now;
         self.dirty = false;
         self.last_call = now;
+        if self.awaiting.is_some() {
+            self.unanswered = self.unanswered.saturating_add(1);
+        }
         let mut items = Vec::new();
         for (key, q) in self.quotas.iter_mut() {
             let in_play = q.granted > 0 || q.reported > 0 || q.lent > 0 || q.ask() > 0;
@@ -937,6 +960,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             items,
         };
         self.outbound.push(Action::Call(parent, req));
+        self.awaiting = Some(now);
     }
 }
 
@@ -1436,5 +1460,75 @@ mod tests {
         );
         n.set_parent(3);
         assert_eq!(n.parent(), Some(&3), "already the parent: unchanged");
+    }
+
+    #[test]
+    fn a_lost_keepalive_is_retried_and_the_share_does_not_lapse() {
+        let cfg = Config { ttl: 20 };
+        let mut leader = Lease::<u32, &str>::new(1, cfg);
+        let mut child = Lease::<u32, &str>::new(2, cfg);
+        for l in [&mut leader, &mut child] {
+            l.set_limit(
+                "k",
+                Limit {
+                    limit: 100,
+                    chunk: 10,
+                },
+            );
+            l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        }
+        child.set_parent(1);
+        // The child gets a share.
+        child.acquire(&[("k", 1)]).ok();
+        child.tick(1);
+        let calls = child.ready();
+        let Some(Action::Call(1, req)) = calls.into_iter().next() else {
+            panic!("the child asks its parent");
+        };
+        let resp = leader.on_request(2, req);
+        child.on_response(1, resp);
+        assert!(child.stats(&"k").unwrap().granted > 0);
+        assert!(child.stats(&"k").unwrap().good);
+        // Keep the bucket busy so nothing is handed back; the keepalive at ttl/2 is lost.
+        let mut lost = None;
+        while lost.is_none() {
+            child.tick(1);
+            child.acquire(&[("k", 1)]).ok();
+            for a in child.ready() {
+                let Action::Call(_, r) = a;
+                lost = Some(r);
+            }
+        }
+        let lost = lost.unwrap();
+        // Without a retry the next call would be the next keepalive, at the TTL, and its
+        // answer would land after the share had lapsed. The retry comes within a few ticks.
+        let mut retried = None;
+        for _ in 0..(cfg.ttl / 4) {
+            child.tick(1);
+            child.acquire(&[("k", 1)]).ok();
+            for a in child.ready() {
+                let Action::Call(_, r) = a;
+                retried = Some(r);
+            }
+            if retried.is_some() {
+                break;
+            }
+        }
+        let retried = retried.expect("the lost call is sent again");
+        assert!(retried.sent > lost.sent);
+        let resp = leader.on_request(2, retried);
+        child.on_response(1, resp);
+        // Past the old validity the share is still good, and never dropped to zero.
+        while child.now <= lost.sent + cfg.ttl + 1 {
+            child.tick(1);
+            child.acquire(&[("k", 1)]).ok();
+            let _ = child.ready();
+            assert!(
+                child.stats(&"k").unwrap().granted > 0,
+                "the share lapsed at {}",
+                child.now
+            );
+        }
+        assert!(child.stats(&"k").unwrap().good);
     }
 }
