@@ -1638,4 +1638,119 @@ mod tests {
             "node 3's 60 bytes are still stored; the leader should still count them"
         );
     }
+
+    /// Leader 1 with two children, 2 and 3, and a grandchild 4 under 2 holding a chunk.
+    fn tree_with_a_grandchild() -> Vec<Lease<u32, &'static str>> {
+        let mut ns = vec![node(1), node(2), node(3), node(4)];
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3, 4]), 1, 1);
+        }
+        ns[1].set_upstream(1);
+        ns[2].set_upstream(1);
+        ns[3].set_upstream(2);
+        route(&mut ns);
+        // Everyone has something in play, so the leader hears from everyone.
+        let _ = ns[1].acquire(&[(BYTES, 10)]);
+        let _ = ns[2].acquire(&[(BYTES, 10)]);
+        let _ = ns[3].acquire(&[(BYTES, 10)]);
+        for _ in 0..12 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns);
+        }
+        assert_eq!(ns[3].stats(&BYTES).unwrap().granted, 100);
+        assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 100, "2 books 4");
+        ns
+    }
+
+    #[test]
+    fn a_moved_lease_is_booked_by_both_parents_until_the_new_one_answers() {
+        let mut ns = tree_with_a_grandchild();
+        // 4 moves from 2 to 3: two deliveries through 3.
+        ns[3].set_upstream(3);
+        ns[3].set_upstream(3);
+        assert_eq!(ns[3].parent(), Some(&3));
+        // The only call out of 4 is to its new parent; nothing goes to the old one yet.
+        let calls = ns[3].ready();
+        assert_eq!(calls.len(), 1);
+        let Action::Call(to, req) = calls.into_iter().next().unwrap();
+        assert_eq!(to, 3);
+        let resp = ns[2].on_request(4, req);
+        assert_eq!(
+            ns[2].stats(&BYTES).unwrap().lent,
+            100,
+            "the new parent adopted it"
+        );
+        assert_eq!(
+            ns[1].stats(&BYTES).unwrap().lent,
+            100,
+            "the old one still books it"
+        );
+        // The answer arrives: now, and only now, the old parent is told.
+        ns[3].on_response(3, resp);
+        let calls = ns[3].ready();
+        assert_eq!(calls.len(), 1);
+        let Action::Call(to, req) = calls.into_iter().next().unwrap();
+        assert_eq!(to, 2);
+        assert_eq!(req.items[0].granted, 0);
+        let _ = ns[1].on_request(4, req);
+        assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 0, "let go");
+        assert_eq!(
+            ns[3].stats(&BYTES).unwrap().granted,
+            100,
+            "the child kept its lease"
+        );
+    }
+
+    #[test]
+    fn if_the_new_parent_never_answers_the_old_booking_stays_until_it_lapses() {
+        let mut ns = tree_with_a_grandchild();
+        ns[3].set_upstream(3);
+        ns[3].set_upstream(3);
+        let _ = ns[3].ready(); // the call to 3 is lost
+        assert_eq!(
+            ns[1].stats(&BYTES).unwrap().lent,
+            100,
+            "still booked at the old parent"
+        );
+        for _ in 0..41 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            // Only 1, 2 and 3 talk; 4's calls go nowhere, and none of them is to 2.
+            let lost = ns[3].ready();
+            assert!(
+                !lost.iter().any(|Action::Call(to, _)| *to == 2),
+                "never told"
+            );
+            route(&mut ns[..3]);
+        }
+        assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 0, "lapsed by ttl");
+    }
+
+    #[test]
+    fn an_answer_from_anyone_but_the_parent_carries_only_the_term() {
+        let (mut l, mut c) = pair();
+        let _ = c.acquire(&[(BYTES, 10)]);
+        c.tick(1);
+        exchange(&mut c, &mut l);
+        assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
+        // A stranger answers with a grant and a cut; neither counts, the term does.
+        c.on_response(
+            9,
+            LeaseResponse {
+                term: 5,
+                leader: Some(9),
+                in_reply_to: 0,
+                items: vec![ResponseItem {
+                    key: BYTES,
+                    grant: 500,
+                    hold: 0,
+                }],
+            },
+        );
+        assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
+        assert_eq!(c.term(), 5);
+    }
 }
