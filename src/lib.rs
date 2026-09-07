@@ -103,6 +103,7 @@ pub struct Limit {
 
 /// One limit in a [`LeaseRequest`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RequestItem<K> {
     /// The limit.
     pub key: K,
@@ -119,6 +120,7 @@ pub struct RequestItem<K> {
 
 /// child -> parent: the one call. A report and a request in one, for every limit in play.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LeaseRequest<Id, K> {
     /// The child's term.
     pub term: u64,
@@ -135,6 +137,7 @@ pub struct LeaseRequest<Id, K> {
 
 /// One limit in a [`LeaseResponse`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ResponseItem<K> {
     /// The limit.
     pub key: K,
@@ -145,6 +148,7 @@ pub struct ResponseItem<K> {
 /// parent -> child: the answer. A stale leader learns of its successor from `term` on the
 /// first answer it gets; so does a child from any ancestor's.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LeaseResponse<Id, K> {
     /// The parent's term.
     pub term: u64,
