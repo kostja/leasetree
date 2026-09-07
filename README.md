@@ -107,10 +107,31 @@ itself, so skew between nodes does not matter; what matters is that a node's clo
 back, see the configuration section. This is the lease discipline of Chubby and GFS: a holder
 dates its lease from the request it sent, not from the reply.
 
+**A child calls on change, and every `ttl / 2` regardless; a parent books what the child
+reports.** Two reasons to call, kept apart. The keepalive is time-driven: with no news, a
+child still calls every `ttl / 2`, so one lost call does not lapse its lease. Everything
+else is change-driven, at the next tick: what the node holds changed, what it wants changed,
+what it covers changed, or its term did. And the parent's booking is what the child says it
+holds, not what the parent sent: a grant that never arrived, room the child gave back on its
+own, a lease adopted from another parent, all reconcile on the next call, and the parent
+keeps no memory of what it sent. Parent P has booked child C at 100:
+
+| tick | at C | P books, after C's next call |
+|---|---|---|
+| 10 | a write is refused | C calls at 11 with `wanted: 100`; P gives what it can, books 200 |
+| 14 | C moves under P2 | C tells P2 `granted: 200`; P2 books 200; P still books 200 |
+| 16 | P2's first answer arrives | C tells P `granted: 0`; P books 0 |
+| 30 | nothing, for twenty ticks | C calls P2 anyway |
+
+Without it: reporting only on the keepalive made every change wait up to `ttl / 2`, so a new
+leader's coverage took depth × `ttl / 2` to fill and a moved lease was booked twice for that
+long; reporting only on change lost the parent's way to lapse a silent child; and booking what
+the parent sent, not what the child reports, left a stale booking behind every lost grant and
+every move, a quarter of the shares in one simulator run. The cost is one call per node per
+`ttl / 2` when idle, more only while something changes, and none at all with nothing in play.
+
 The remaining rules, in short:
 
-- A child calls whenever what it holds, wants or covers changed, or its term did, and every
-  `ttl / 2` as a keepalive. A parent books what the child reports.
 - A parent that cannot fill a request books the child anyway, asks its own parent for the
   shortfall at once, keeps that much earmarked, and says so in its answer, so the child asks
   again after a round trip rather than after the retry period.
