@@ -48,7 +48,6 @@ call, for every limit in play at once:
 pub struct LeaseRequest<Id, K> {
     pub term: u64, pub leader: Option<Id>,  // the child's view; a stale parent learns from it
     pub sent: u64,                          // the child's tick: the lease is dated from it
-    pub members: Vec<Id>,                   // the child's subtree, itself included
     pub items: Vec<RequestItem<Id, K>>,
 }
 pub struct RequestItem<Id, K> {
@@ -69,8 +68,8 @@ pub struct ResponseItem<K> {
 }
 ```
 
-A child calls every `ttl / 2` as a keepalive, and at once when what it holds, wants or covers
-changed or its term did. While it wants something it also retries: after a round trip at
+A child calls every `ttl / 2` as a keepalive, and at once when what it holds or wants changed
+or its term did. While it wants something it also retries: after a round trip at
 first, since the parent may be fetching it, then twice as long after each empty answer, up
 to `ttl / 8`, so an exhausted quota is not polled hard.
 
@@ -116,7 +115,7 @@ dates its lease from the request it sent, not from the reply.
 reports.** Two reasons to call, kept apart. The keepalive is time-driven: with no news, a
 child still calls every `ttl / 2`, so one lost call does not lapse its lease. Everything
 else is change-driven, at the next tick: what the node holds changed, what it wants changed,
-what it covers changed, or its term did. And the parent's booking is what the child says it
+or its term did. And the parent's booking is what the child says it
 holds, not what the parent sent: a grant that never arrived, room the child gave back on its
 own, a lease adopted from another parent, all reconcile on the next call, and the parent
 keeps no memory of what it sent. Parent P has booked child C at 100:
@@ -265,10 +264,32 @@ is alive, since a lease is renewed at `ttl / 2` and never reaches `ttl`. When th
 dead, a stock loses its unspent room a TTL after the last answer and refuses until re-leased
 under a new parent; a rate admits without a lease and loses nothing.
 
-The remaining rule, in short:
+**A new leader lends nothing new and cuts nobody for one `ttl`; a lease converts the moment
+its holder learns the new term.** Two concerns, kept apart. Safety: when a node is crowned it
+holds the whole limit, but its bookings are only what its own children have reported, and
+every other lease is booked somewhere in the old tree. Its room is not room until those are
+booked again, so for one `ttl` it gives out nothing new and cuts nobody, since its over-commit
+meanwhile is rule four's double booking, not adoption gone wrong. By the end of the `ttl`
+every lease it never heard of has lapsed at its holder, and every holder that learned the
+new term is fenced until converted. Liveness: nobody waits for anyone. Raft pushes the new
+leader to every node at once, and on that event every node that holds anything calls
+whatever parent it has, the parent books it, and the answer, carrying the new term, confirms
+it: the old lease is a new one. A node whose parent was the old leader, which is most likely
+what died, takes the first upstream it is offered instead of waiting for two deliveries.
+Node C holds 100 under P, which held it from the old leader L, when L′ is elected at 300:
 
-- A new leader grants nothing and cuts nobody until its reports cover every live member, or one
-  `ttl` has passed.
+| tick | what happens | C's lease |
+|---|---|---|
+| 303 | Raft shows term 2; C calls P, P calls its parent | fenced |
+| 305 | the answers come back carrying term 2 | good again |
+| 306 | C's chunk runs out; it asks for more | refused: L′ lends nothing new yet |
+| 340 | the `ttl` is over | L′ lends again |
+
+An earlier version waited instead until the reports covered every live member, so the
+window was a few ticks when every node reported and a full `ttl` whenever one did not; and a
+node with nothing in play never reports. The count answered the wrong question. New room
+waits a `ttl` after a leader change; that is seconds, and a stock fills over days.
+
 
 ## What the caller supplies
 
@@ -354,10 +375,10 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 |---|---|
 | `ttl` | how long a lease is good without renewal; default 40 |
 | keepalive call | every `ttl / 2` |
+| a new leader lends nothing new for | `ttl` after crowning |
 | ask again for what is wanted | after a round trip, doubling after each empty answer, up to `ttl / 8` |
 | cut a child, once over-committed for | `ttl / 8` |
 | leave a parent | after it missed two deliveries of the leader's traffic |
-| a new leader's fallback window | `ttl` |
 
 Drive `tick` from a **monotonic clock**, never wall time. A node compares only its own clock
 readings, so skew between nodes is harmless; but a clock that steps back keeps a lapsed lease
@@ -366,8 +387,8 @@ lapses everything at once.
 
 With a tick of 100 ms, `ttl: 40` is a four-second lease, called for every two seconds. A node
 whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks. A
-new leader lends again as soon as its reports cover every live member, or after four seconds
-if some member never speaks: a node with nothing in play sends nothing, and is not counted.
+new leader lends again four seconds after it was crowned; leases held from the old one
+convert as soon as Raft shows the new term, without waiting.
 
 ## Open
 

@@ -29,8 +29,8 @@
 //! # One call
 //!
 //! The whole protocol is one RPC from a child to its parent: a [`LeaseRequest`] answered by a
-//! [`LeaseResponse`]. The child calls every `ttl / 2`, at once when what it holds, wants or
-//! covers changed, and while it wants something: after a round trip at first, then twice as
+//! [`LeaseResponse`]. The child calls every `ttl / 2`, at once when what it holds or wants
+//! changed or its term did, and while it wants something: after a round trip at first, then twice as
 //! long after each empty answer, up to `ttl / 8`. A request reports, per limit, what the
 //! child holds from the parent (less than before is a release), what more it wants, and, for
 //! a stock, the usage map of its subtree. A response grants, and tells the child all the
@@ -65,8 +65,8 @@
 //!
 //! - A lease is dated from the tick the request was *sent*, so a parent that lapses it
 //!   (dated from arrival, later) never re-lends room the child still considers its own.
-//! - A child calls whenever what it holds, wants or covers changed, or its term did, and
-//!   every `ttl / 2` as a keepalive. A parent books what the child reports.
+//! - A child calls whenever what it holds or wants changed, or its term did, and every
+//!   `ttl / 2` as a keepalive. A parent books what the child reports.
 //! - A node without a good lease asks for one whatever the kind decides about the write.
 //! - A node that moves to a new parent reports to the old one that it holds nothing from it,
 //!   but only once the new parent has confirmed the adoption; until then both book it and
@@ -82,8 +82,10 @@
 //!   child. The lease tree follows the overlay's tree and its changes, two deliveries behind,
 //!   and does not follow a single detour.
 //! - A node drops a lease the moment it lapses: the parent has re-lent that room.
-//! - A new leader grants nothing and cuts nobody until its reports cover every live member,
-//!   or one `ttl` has passed.
+//! - A new leader lends nothing new and cuts nobody for one `ttl` after it is crowned: by
+//!   then every lease it never heard of has lapsed, and every holder that learned the new
+//!   term is fenced until converted. A lease converts the moment its holder learns the new
+//!   term from Raft: it calls whatever parent it has, and the answer confirms it.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -177,8 +179,6 @@ pub struct LeaseRequest<Id, K> {
     pub leader: Option<Id>,
     /// The child's tick. A lease is dated from it.
     pub sent: u64,
-    /// The child's subtree, itself included.
-    pub members: Vec<Id>,
     /// The limits.
     pub items: Vec<RequestItem<Id, K>>,
 }
@@ -340,12 +340,6 @@ impl<Id: Ord + Clone> Quota<Id> {
     }
 }
 
-/// A tree link to a child: what it last reported about its subtree.
-struct Link<Id> {
-    members: BTreeSet<Id>,
-    expires: u64,
-}
-
 /// One node's lease state, for every limit.
 pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     me: Id,
@@ -359,7 +353,6 @@ pub struct Lease<Id: Ord + Clone, K: Ord + Clone> {
     /// Deliveries of the leader's traffic through other peers since the parent last delivered.
     parent_misses: u32,
     leader_since: u64,
-    links: BTreeMap<Id, Link<Id>>,
     quotas: BTreeMap<K, Quota<Id>>,
     /// After a parent change: the old parent, told that we hold nothing from it once the new
     /// parent has confirmed the adoption.
@@ -384,7 +377,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             parent: None,
             parent_misses: 0,
             leader_since: 0,
-            links: BTreeMap::new(),
             quotas: BTreeMap::new(),
             owed: None,
             dirty: false,
@@ -443,8 +435,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         if let Some(m) = members {
             self.members = m.iter().cloned().collect();
             let gone: Vec<Id> = self
-                .links
-                .keys()
+                .children()
                 .filter(|c| !self.members.contains(c))
                 .cloned()
                 .collect();
@@ -464,6 +455,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
         let changed = term > self.term || self.leader.as_ref() != Some(&leader);
         let was_leader = self.is_leader();
+        let old_leader = self.leader.clone();
         self.term = term;
         self.leader = Some(leader.clone());
         if changed {
@@ -472,7 +464,14 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             } else if leader != self.me && was_leader {
                 self.demote();
             }
-            // A new term: call now, so the answer confirms the lease in it.
+            // The old leader is most likely gone: a node under it takes the first upstream
+            // it is offered rather than waiting for two deliveries.
+            let leader_changed = old_leader.as_ref() != Some(&leader);
+            if leader_changed && self.parent.is_some() && self.parent == old_leader {
+                self.parent = None;
+                self.parent_misses = 0;
+            }
+            // A new term: call now, so the answer converts the lease into it.
             self.dirty = true;
         }
         self.woke(was_empty)
@@ -494,7 +493,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         if self.parent.is_some() && self.parent_misses < 2 {
             return false;
         }
-        if self.links.contains_key(&peer) {
+        if self.children().any(|c| *c == peer) {
             return false;
         }
         self.reparent(peer);
@@ -506,7 +505,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     pub fn down(&mut self, peers: &[Id]) -> bool {
         for p in peers {
             self.down.insert(p.clone());
-            if self.links.contains_key(p) {
+            if self.children().any(|c| c == p) {
                 self.forget_child(p);
             }
             if self.parent.as_ref() == Some(p) {
@@ -537,20 +536,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let ttl = self.cfg.ttl;
         let now = self.now;
         let grace = Self::grace(ttl);
-        // The link: what the child covers.
-        let members: BTreeSet<Id> = req.members.iter().cloned().collect();
-        let link = self.links.entry(from.clone()).or_insert(Link {
-            members: BTreeSet::new(),
-            expires: 0,
-        });
-        if link.members != members {
-            // Our subtree changed: report it up at once, so a new leader's coverage does not
-            // wait for the periodic call.
-            self.dirty = true;
-        }
-        link.members = members;
-        link.expires = now + ttl;
-        // With the link in place: is a new leader still waiting to hear from everyone?
+        // A new leader lends nothing new for a TTL.
         let settling = self.is_leader() && !self.may_grant();
         let can_ask = self.parent.is_some();
 
@@ -632,7 +618,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 .is_some_and(|b| b.granted > 0 || b.wanted > 0)
         });
         if !still {
-            self.links.remove(&from);
             for q in self.quotas.values_mut() {
                 q.children.remove(&from);
             }
@@ -665,7 +650,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             q.cap.grant(it.grant);
             if it.grant > 0 {
                 q.reported += it.grant;
-                q.wanted = q.wanted.saturating_sub(it.grant);
+                // What arrived goes to the children waiting for it first; only the rest
+                // counts against our own want, or a child would take what we asked for.
+                let for_children = q.earmarked().min(it.grant);
+                q.wanted = q.wanted.saturating_sub(it.grant - for_children);
                 q.refusals = 0;
             } else if q.want() > 0 {
                 q.refusals = q.refusals.saturating_add(1);
@@ -714,15 +702,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             } else {
                 None
             };
-        }
-        let gone: Vec<Id> = self
-            .links
-            .iter()
-            .filter(|(_, l)| l.expires < now)
-            .map(|(c, _)| c.clone())
-            .collect();
-        for c in gone {
-            self.links.remove(&c);
         }
         if !leader {
             self.drop_lapsed();
@@ -830,9 +809,16 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.parent.as_ref()
     }
 
-    /// This node's children in the tree.
+    /// This node's children in the tree: the peers it books anything for.
     pub fn children(&self) -> impl Iterator<Item = &Id> {
-        self.links.keys()
+        let mut out: Vec<&Id> = self
+            .quotas
+            .values()
+            .flat_map(|q| q.children.keys())
+            .collect();
+        out.sort();
+        out.dedup();
+        out.into_iter()
     }
 
     /// This node's view of a stock's usage under it, itself included. Exact at the leader,
@@ -922,7 +908,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     }
 
     fn forget_child(&mut self, c: &Id) {
-        self.links.remove(c);
         for q in self.quotas.values_mut() {
             if let Some(b) = q.children.remove(c) {
                 q.lent -= b.granted;
@@ -997,7 +982,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             term: self.term,
             leader: self.leader.clone(),
             sent: self.now,
-            members: Vec::new(),
             items: keys
                 .iter()
                 .map(|k| RequestItem {
@@ -1010,27 +994,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
     }
 
-    fn subtree(&self) -> Vec<Id> {
-        let mut out = BTreeSet::new();
-        out.insert(self.me.clone());
-        for (c, l) in &self.links {
-            out.insert(c.clone());
-            out.extend(l.members.iter().cloned());
-        }
-        out.into_iter().collect()
-    }
-
-    /// The leader's rule: nothing new until the reports cover every live member, or one
-    /// `ttl` has passed since the change.
+    /// The leader's rule: nothing new for one `ttl` after being crowned. By then every lease
+    /// it never heard of has lapsed at its holder, and every holder that learned the new term
+    /// is fenced until its lease is converted.
     fn may_grant(&self) -> bool {
-        if self.now >= self.leader_since + self.cfg.ttl {
-            return true;
-        }
-        let covered: BTreeSet<Id> = self.subtree().into_iter().collect();
-        self.members
-            .iter()
-            .filter(|m| !self.down.contains(m))
-            .all(|m| covered.contains(m))
+        self.now >= self.leader_since + self.cfg.ttl
     }
 
     /// Whether it is time to call the parent: something changed, the keepalive is due, or
@@ -1113,7 +1081,6 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             term: self.term,
             leader: self.leader.clone(),
             sent: now,
-            members: self.subtree(),
             items,
         };
         self.outbound.push(Action::Call(parent, req));
@@ -1148,6 +1115,13 @@ mod tests {
         n.set_limit(BYTES, stock());
         n.set_limit(RPS, rate());
         n
+    }
+
+    /// Past a new leader's window: nothing new is lent for a `ttl` after crowning.
+    fn settle(nodes: &mut [Lease<u32, &'static str>]) {
+        for n in nodes.iter_mut() {
+            n.tick(40);
+        }
     }
 
     /// Make every queued call among `nodes` (ids 1..) and feed back the answers, until quiet.
@@ -1195,6 +1169,8 @@ mod tests {
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        l.tick(40);
+        c.tick(40);
         c.set_upstream(1);
         exchange(&mut c, &mut l);
         (l, c)
@@ -1264,6 +1240,8 @@ mod tests {
         let mut c = node(2);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        l.tick(40);
+        c.tick(40);
         assert!(c.acquire(&[(RPS, 1)]).is_ok(), "no lease, but a rate");
         assert!(c.acquire(&[(BYTES, 1)]).is_err(), "no lease, and a stock");
         c.set_upstream(1);
@@ -1385,6 +1363,7 @@ mod tests {
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
         }
+        settle(&mut ns);
         ns[1].set_upstream(1);
         ns[2].set_upstream(2);
         route(&mut ns);
@@ -1427,6 +1406,7 @@ mod tests {
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
         }
+        settle(&mut ns);
         ns[1].set_upstream(1);
         ns[2].set_upstream(2);
         route(&mut ns);
@@ -1451,9 +1431,11 @@ mod tests {
     fn a_refused_ask_backs_off_up_to_ttl_over_eight() {
         let mut l = node(1);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
+        l.tick(40);
         l.acquire(&[(BYTES, 1000)]).unwrap(); // the quota is exhausted
         let mut c = node(2);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
+        c.tick(40);
         c.set_upstream(1);
         let _ = c.acquire(&[(BYTES, 10)]);
         let mut asked_at = Vec::new();
@@ -1510,21 +1492,25 @@ mod tests {
         // re-lend room the child still considers its own.
         let (mut l, mut c) = pair();
         let _ = c.acquire(&[(BYTES, 10)]);
-        // The child's call goes at 100, arrives at 101, is answered at 102.
+        // The child's call goes at 140, arrives at 141, is answered at 142.
         c.tick(100);
         l.tick(101);
         let Action::Call(_, req) = c.ready().remove(0);
         let resp = l.on_request(2, req);
         c.on_response(1, resp);
         assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
-        assert_eq!(c.stats(&BYTES).unwrap().valid_until, 140, "100 + ttl");
-        c.tick(40); // 140: the last good tick
+        assert_eq!(
+            c.stats(&BYTES).unwrap().valid_until,
+            180,
+            "sent at 140, plus ttl"
+        );
+        c.tick(40); // 180: the last good tick
         assert!(c.acquire(&[(BYTES, 10)]).is_ok());
-        c.tick(1); // 141
+        c.tick(1); // 181
         assert!(c.acquire(&[(BYTES, 10)]).is_err(), "the child stopped");
-        l.tick(40); // 141: the parent still books it
+        l.tick(40); // 181: the parent still books it
         assert_eq!(l.stats(&BYTES).unwrap().lent, 100);
-        l.tick(1); // 142: and only now lets it go
+        l.tick(1); // 182: and only now lets it go
         assert_eq!(l.stats(&BYTES).unwrap().lent, 0);
     }
 
@@ -1562,6 +1548,7 @@ mod tests {
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
         }
+        settle(&mut ns);
         ns[1].set_upstream(1);
         ns[2].set_upstream(1);
         route(&mut ns);
@@ -1641,6 +1628,7 @@ mod tests {
             n.set_limit(RPS, rate());
             n.set_cluster_view(Some(&[1, 2]), 1, 2);
         }
+        settle(&mut fresh);
         fresh[1].set_upstream(1);
         for _ in 0..21 {
             for n in fresh.iter_mut() {
@@ -1661,6 +1649,7 @@ mod tests {
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3, 4]), 1, 1);
         }
+        settle(&mut ns);
         ns[1].set_upstream(1);
         ns[2].set_upstream(1);
         ns[3].set_upstream(2);
@@ -1791,6 +1780,7 @@ mod tests {
         for n in ns.iter_mut() {
             n.set_cluster_view(Some(&[1, 2, 3, 4]), 1, 1);
         }
+        settle(&mut ns);
         ns[1].set_upstream(1); // A
         ns[2].set_upstream(1); // B
         ns[3].set_upstream(3); // D under B
@@ -1804,8 +1794,17 @@ mod tests {
             }
             route(&mut ns);
         }
+        // A node whose chunk a child took asks again on its next write, as a real one does.
         for n in ns[1..].iter_mut() {
-            n.acquire(&[(BYTES, 10)]).unwrap();
+            let _ = n.acquire(&[(BYTES, 10)]);
+        }
+        for _ in 0..8 {
+            step(&mut ns);
+        }
+        for n in ns[1..].iter_mut() {
+            if n.stats(&BYTES).unwrap().used == 0 {
+                n.acquire(&[(BYTES, 10)]).unwrap();
+            }
         }
         assert_eq!(
             ns[0].stats(&BYTES).unwrap().lent,
