@@ -219,7 +219,7 @@ struct Quota<Id: Ord + Clone> {
     /// `ttl / 8`.
     refusals: u32,
     /// Share a child gave back or lapsed: fetched for it, and handed back up at the next
-    /// call unless we want it ourselves, or a moved share would be counted twice.
+    /// call, or a moved share would be counted twice.
     returning: u64,
 }
 
@@ -838,10 +838,11 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             if !in_play {
                 continue;
             }
-            // What a child gave back was fetched for it: hand it back up, less what we want
-            // ourselves, or a share that moved is used twice, here and under its new parent.
+            // What a child gave back was fetched for it and is the tree's, not ours: hand it
+            // back up, whatever we want ourselves, or a share that moved is used twice, here
+            // and under its new parent. If we want more, we ask like anyone.
             if q.returning > 0 {
-                let back = q.returning.min(q.room()).saturating_sub(q.wanted);
+                let back = q.returning.min(q.room());
                 q.granted -= back;
                 q.returning = 0;
             }
