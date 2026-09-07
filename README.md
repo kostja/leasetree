@@ -174,7 +174,7 @@ use leasetree::{Lease, Config, Limit, Action};
 // Boot: the limits from configuration, the view from Raft.
 let mut lease = Lease::new(my_raft_id, Config { ttl: 40 });
 for row in quota_table {
-    lease.set_limit(row.key(), Limit { limit: row.per_tick, chunk: row.chunk });
+    lease.set_limit(row.key(), Limit { limit: row.per_tick, chunk: row.chunk, burst: row.burst });
 }
 lease.set_cluster_view(Some(&instances), leader, term);
 
@@ -225,6 +225,7 @@ Every duration is in ticks; the caller decides what a tick is. There is one knob
 | keepalive call | every `ttl / 2` |
 | ask again for what is wanted | after a round trip, doubling after each empty answer, up to `ttl / 8` |
 | leave a parent | after it missed two deliveries of the leader's traffic |
+| `Limit::burst` | the bucket's capacity on a node, in units, when two ticks of its share are less; at least one request, or a share below a request per tick never serves one |
 
 Drive `tick` from a **monotonic clock**, never wall time. A node compares only its own clock
 readings, so skew between nodes is harmless; but a clock that steps back keeps a lapsed share

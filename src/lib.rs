@@ -102,6 +102,9 @@ pub struct Limit {
     pub limit: u64,
     /// How much a node asks for at a time, and keeps in hand when idle.
     pub chunk: u64,
+    /// The bucket's capacity on this node, in units, when two ticks of its share are
+    /// less: a share below one request per tick still serves a request, after saving up.
+    pub burst: u64,
 }
 
 /// One limit in a [`LeaseRequest`].
@@ -708,7 +711,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 // A cut: the bucket shrinks to one tick of the new share, no burst, or every
                 // cut would leak one; and the children are cut on their keepalives, since
                 // our split now has less to split.
-                q.tokens = q.tokens.min(q.refill().max(1.0));
+                q.tokens = q.tokens.min(q.refill().max(1.0).max(q.limit.burst as f64));
                 self.dirty = true;
             }
             q.valid_until = Some(q.valid_until.unwrap_or(0).max(resp.in_reply_to + ttl));
@@ -732,7 +735,8 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 None
             };
             let refill = q.refill();
-            q.tokens = (q.tokens + refill * n as f64).min(refill.max(1.0) * 2.0);
+            let cap = (refill.max(1.0) * 2.0).max(q.limit.burst as f64);
+            q.tokens = (q.tokens + refill * n as f64).min(cap);
             // A child that stopped calling: its share is ours again. The counters stay, so
             // that it can come back and catch up.
             let mut expired = 0;
@@ -1025,7 +1029,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             }
             // While the bucket is full we are not using our share: keep one chunk beyond
             // what we lent, and never what a child is waiting for; hand back the rest.
-            let full = q.tokens >= q.refill().max(1.0) * 2.0;
+            let full = q.tokens >= (q.refill().max(1.0) * 2.0).max(q.limit.burst as f64);
             if full {
                 let keep = q
                     .lent()
@@ -1123,6 +1127,7 @@ mod tests {
         Limit {
             limit: 30,
             chunk: 2,
+            burst: 0,
         }
     }
 
@@ -1320,7 +1325,14 @@ mod tests {
     fn a_refused_ask_backs_off_up_to_ttl_over_eight() {
         let mut l = node(1);
         l.set_cluster_view(Some(&[1, 2]), 1, 1);
-        l.set_limit(RPS, Limit { limit: 0, chunk: 2 }); // nothing to lend
+        l.set_limit(
+            RPS,
+            Limit {
+                limit: 0,
+                chunk: 2,
+                burst: 0,
+            },
+        ); // nothing to lend
         let mut c = node(2);
         c.set_cluster_view(Some(&[1, 2]), 1, 1);
         c.set_upstream(1);
@@ -1475,7 +1487,14 @@ mod tests {
     #[test]
     fn an_acquire_is_all_or_none() {
         let mut l = node(1);
-        l.set_limit("bps", Limit { limit: 5, chunk: 1 });
+        l.set_limit(
+            "bps",
+            Limit {
+                limit: 5,
+                chunk: 1,
+                burst: 0,
+            },
+        );
         l.set_cluster_view(Some(&[1]), 1, 1);
         l.tick(1);
         assert!(l.acquire(&[(RPS, 1), ("bps", 100)]).is_err());
@@ -1535,7 +1554,14 @@ mod tests {
         let mut ns: Vec<Lease<u32, &'static str>> = (1..=5)
             .map(|id| {
                 let mut n = Lease::new(id, Config { ttl: 40 });
-                n.set_limit(RPS, Limit { limit: 6, chunk: 2 });
+                n.set_limit(
+                    RPS,
+                    Limit {
+                        limit: 6,
+                        chunk: 2,
+                        burst: 0,
+                    },
+                );
                 n
             })
             .collect();
@@ -1592,6 +1618,7 @@ mod tests {
             Limit {
                 limit: 100,
                 chunk: 10,
+                burst: 0,
             },
         );
         n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
@@ -1634,6 +1661,7 @@ mod tests {
                 Limit {
                     limit: 100,
                     chunk: 10,
+                    burst: 0,
                 },
             );
             l.set_cluster_view(Some(&[1, 2]), 1, 1);
@@ -1709,7 +1737,14 @@ mod tests {
 
     fn leader_with(limit: u64) -> Lease<u32, &'static str> {
         let mut l = Lease::new(1, Config { ttl: 20 });
-        l.set_limit(RPS, Limit { limit, chunk: 2 });
+        l.set_limit(
+            RPS,
+            Limit {
+                limit,
+                chunk: 2,
+                burst: 0,
+            },
+        );
         l.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
         l
     }
@@ -1823,6 +1858,7 @@ mod tests {
             Limit {
                 limit: 60,
                 chunk: 1,
+                burst: 0,
             },
         );
         mid.set_cluster_view(Some(&[1, 2, 3, 4, 5]), 1, 1);
@@ -1879,5 +1915,32 @@ mod tests {
             assert_eq!(share(&mid.on_request(c, report(14))), 0, "child {c} is cut");
         }
         assert_eq!(mid.stats(&"k").unwrap().overcommit, 0);
+    }
+
+    #[test]
+    fn a_share_below_a_request_per_tick_saves_up_to_the_burst() {
+        // A rate of 1 unit per tick, requests of 10 units: two ticks of share never fit
+        // one; a burst of 10 does, once every ten ticks.
+        let mut l = Lease::<u32, &str>::new(1, Config { ttl: 40 });
+        l.set_limit(
+            "k",
+            Limit {
+                limit: 1,
+                chunk: 1,
+                burst: 10,
+            },
+        );
+        l.set_cluster_view(Some(&[1]), 1, 1);
+        l.tick(9);
+        assert!(l.acquire(&[("k", 10)]).is_err(), "nine ticks: nine units");
+        l.tick(1);
+        assert!(l.acquire(&[("k", 10)]).is_ok(), "ten ticks: one request");
+        assert!(l.acquire(&[("k", 10)]).is_err());
+        l.tick(100);
+        assert!(l.acquire(&[("k", 10)]).is_ok());
+        assert!(
+            l.acquire(&[("k", 10)]).is_err(),
+            "the bucket holds one request, not ten"
+        );
     }
 }
