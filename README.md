@@ -180,11 +180,43 @@ unspendable meanwhile: a false denial, never an overshoot. An answer from anyone
 current parent carries only the term. The double booking is what the simulator's
 `overbooked` column shows during a leader change.
 
+**A parent that booked more than it holds cuts a stock, after a grace period and never below
+what the child's subtree has used; a rate is never cut.** A parent ends up having lent more
+than it holds by adoption: a child arrives from elsewhere holding 100, the parent books it,
+and its bookings exceed its own lease by 100. That is not itself a risk, since a parent with
+no room lends nothing. But the excess is spendable below and covered by nothing above. The
+parent first asks upward for it; if the quota has room, the over-commit is fetched and
+nothing is cut. If not, the parent cuts: its answer's `hold` is below what the child holds.
+The child gives back what it has not spent itself, down to the hold. What it had lent to its
+own children it cannot give back, so it is now over-committed towards them, and they learn
+it in their next answers. A node is never asked to hold less than its subtree has used,
+which the child reported in the same call, because that cannot be unspent. P holds 500, has
+lent 400 to A, and adopts C, which holds 100 and has used 30, while the quota is full:
+
+| tick | P books | P holds | what happens |
+|---|---|---|---|
+| 14 | 500 | 500 | C adopted; P asks upward for 100 and gets nothing |
+| 19 | 500 | 500 | grace over; C's next call is answered with `hold: 30` |
+| 20 | 430 | 500 | C gave back its 70 unspent; P's bookings fit again |
+
+The three qualifiers, and why each. *A stock only:* a rate admits without a lease and so
+beyond one; cutting it would only stall nodes, and its over-commit resolves by fetching. *After
+a grace period,* `ttl / 8`: a moving lease is booked by both parents for a round trip on
+purpose, and a parent that cut on the first call would cut every lease that merely passed
+through. *Never below usage:* it cannot be unspent.
+
+What this rule does not do: a cut reaches a child in that child's next call, and a grandchild
+in the grandchild's, which with nothing wanted is the keepalive, so it walks down at up to
+`ttl / 2` per level, and the subtree keeps writing against the over-committed lease
+meanwhile. That is the stock's overshoot: what a subtree writes during the walk, and only
+when adoption over-commit could not be fetched, that is, when the quota is full during a
+re-orientation. In the simulator at N=200 it is about 1.3% of the limit after a leader change.
+Fetching first keeps it rare; only a second, parent-initiated RPC would make the walk fast,
+and that is not worth the second RPC: a stock is capacity that fills over days, and a leader
+change is seconds. This crate is not a billing boundary.
+
 The remaining rules, in short:
 
-- A parent that booked more than it holds cuts a stock only after a grace period, never below
-  what the child's subtree has used; the child gives back what it can and its own children
-  learn the rest in their next answers. A rate is never cut.
 - A node keeps its parent while that parent keeps delivering the leader's traffic, and never
   takes its own child as parent.
 - A node drops a lease the moment it lapses: the parent has re-lent that room.

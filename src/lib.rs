@@ -71,9 +71,12 @@
 //! - A node that moves to a new parent reports to the old one that it holds nothing from it,
 //!   but only once the new parent has confirmed the adoption; until then both book it and
 //!   nobody re-lends it.
-//! - A parent that booked more than it holds cuts a stock only after a grace period, never
-//!   below what the child's subtree has used; the child gives back what it can and passes
-//!   the rest on to its own children in their next answers. A rate is never cut.
+//! - A parent that booked more than it holds first asks upward for the difference, and cuts
+//!   a stock only if that fails, after a grace period and never below what the child's
+//!   subtree has used; the child gives back what it can and its own children learn the rest
+//!   in their next answers. A cut walks down at up to `ttl / 2` per level, and what the
+//!   subtree writes meanwhile is the stock's overshoot: only under a full quota during a
+//!   re-orientation, and accepted. A rate is never cut.
 //! - A node keeps its parent while that parent keeps delivering the leader's traffic, and
 //!   never takes its own child as parent.
 //! - A node drops a lease the moment it lapses: the parent has re-lent that room.
