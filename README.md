@@ -244,9 +244,29 @@ L waits; A switches to L' after two deliveries and releases from L; then L may t
 cost of the rule is that a dead parent is left after two of the leader's periods rather than
 one, while the lease is still good for a full `ttl`.
 
-The remaining rules, in short:
+**A node drops a lease the moment it lapses.** Past `valid_until`, the node reclaims what it
+holds beyond what it has used and lent, that tick. Used cannot be unspent; lent its children
+still hold under leases of their own, dated from their own calls. The rest is gone, and the
+next call reports the smaller figure. A lapsed lease is one the parent has been free to
+re-lend since the same tick, by the first rule, so the room may already be somebody else's;
+keeping it and reporting it later got it booked or confirmed again, three different ways in
+the simulator. C holds 100 from P, has used 30 and lent 20, and P falls silent at tick 100:
 
-- A node drops a lease the moment it lapses: the parent has re-lent that room.
+| tick | at C | C holds |
+|---|---|---|
+| 100 | last answer from P; good until 140 | 100 |
+| 140 | last good tick; a write of 10 is admitted | 100 |
+| 141 | lapsed: the 40 unspent and unlent are dropped | 60 |
+| 150 | C moves under Q and reports `granted: 60` | 60, and Q books 60 |
+
+Without the rule C would report 100 at tick 150, Q would book it, and the 40 that P may
+have lent elsewhere at 141 would be spendable twice. The rule costs nothing while the parent
+is alive, since a lease is renewed at `ttl / 2` and never reaches `ttl`. When the parent is
+dead, a stock loses its unspent room a TTL after the last answer and refuses until re-leased
+under a new parent; a rate admits without a lease and loses nothing.
+
+The remaining rule, in short:
+
 - A new leader grants nothing and cuts nobody until its reports cover every live member, or one
   `ttl` has passed.
 
