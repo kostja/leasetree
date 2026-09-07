@@ -1,7 +1,7 @@
 # leasetree
 
 A pure state machine for distributed quotas. No IO, no clock. You feed it events; it returns
-messages to send. It is the third of three small crates that together enforce a cluster-wide
+calls to make. It is the third of three small crates that together enforce a cluster-wide
 limit without a round trip on the write path:
 
 - [`bcounter`](https://github.com/kostja/bcounter) does the accounting: a node's grant, and a
@@ -28,8 +28,8 @@ Two kinds of limit, and the kind decides what a node does without a good lease:
   and asks for a lease; availability comes first.
 
 A lease is good while it was confirmed in the current term and has not lapsed. On a leader
-change a lease is fenced, not dropped: a stock waits for its parent's next ack, which carries
-the new term, and a rate keeps admitting. The old tree's bookings stay valid up to the new
+change a lease is fenced, not dropped: a stock waits for its parent's next answer, which
+carries the new term, and a rate keeps admitting. The old tree's bookings stay valid up to the new
 leader, which adopts them. What the fence does not cover is a leader cut off with part of the
 tree: that side never hears the new term and keeps writing what it already held, until Raft
 makes the old leader step down and its children's leases lapse one `ttl` later. That is the
@@ -92,17 +92,17 @@ TTL of 40 and one tick of latency:
 
 | tick | what happens |
 |---|---|
-| 100 | child C sends `Renew` to parent P |
-| 101 | P receives it, books C until 141, replies |
-| 102 | C receives the ack; its lease is good until 140 |
+| 100 | child C calls parent P |
+| 101 | P receives the call, books C until 141, answers |
+| 102 | C receives the answer; its lease is good until 140 |
 
-If C never renews again, C stops spending at 140 and P frees the room at 141. The room is
-never spendable by C and lendable by P at the same time. Dating the lease from the ack's
+If C never calls again, C stops spending at 140 and P frees the room at 141. The room is
+never spendable by C and lendable by P at the same time. Dating the lease from the answer's
 arrival instead, good until 142, is the version that reads as safe and is not: P frees the
 room at 141, lends it to D, and for two ticks both C and D may write. The overshoot is one
 write per node per tick of latency, plus whatever the clocks disagree by; the simulator found
-it as a handful of bytes, and it grows with both. The rule costs nothing on the wire: the ack
-echoes the request's `sent` tick in `in_reply_to`. Each node compares only its own clock with
+it as a handful of bytes, and it grows with both. The rule costs nothing on the wire: the
+answer echoes the request's `sent` tick in `in_reply_to`. Each node compares only its own clock with
 itself, so skew between nodes does not matter; what matters is that a node's clock never steps
 back, see the configuration section. This is the lease discipline of Chubby and GFS: a holder
 dates its lease from the request it sent, not from the reply.
@@ -220,10 +220,20 @@ readings, so skew between nodes is harmless; but a clock that steps back keeps a
 spendable for as long as it stepped. A pause or a forward jump is fine: a large `tick(n)`
 lapses everything at once.
 
-With a tick of 100 ms, `ttl: 40` is a four-second lease, renewed every two seconds. A node
+With a tick of 100 ms, `ttl: 40` is a four-second lease, called for every two seconds. A node
 whose parent dies re-parents at the next two deliveries and is re-leased within a few ticks. A
 new leader lends again as soon as its reports cover every live member, or after four seconds
 if some member never speaks: a node with nothing in play sends nothing, and is not counted.
+
+## Open
+
+- **Usage that leaves with a node.** An expelled node's last reported slot lives on in the
+  maps that merged it, so the total is right while the cluster is up, but nothing durable
+  holds it: after a full restart the leader counts only what live nodes restore from their own
+  rows. The test `a_full_restart_after_an_expulsion_keeps_the_expelled_node_s_usage` exposes
+  it and is ignored until this is solved. Persisting departed rows would fix the restart but
+  not the growth of the map with every node that ever lived; the aim is a bounded fix with no
+  change to the RPC or the API.
 
 ## References
 
