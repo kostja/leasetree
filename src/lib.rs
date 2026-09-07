@@ -218,6 +218,9 @@ struct Quota<Id: Ord + Clone> {
     /// Asks answered with nothing, in a row: the next one waits twice as long, up to
     /// `ttl / 8`.
     refusals: u32,
+    /// Share a child gave back or lapsed: fetched for it, and handed back up at the next
+    /// call unless we want it ourselves, or a moved share would be counted twice.
+    returning: u64,
 }
 
 impl<Id: Ord + Clone> Quota<Id> {
@@ -233,6 +236,7 @@ impl<Id: Ord + Clone> Quota<Id> {
             reported: 0,
             last_request: None,
             refusals: 0,
+            returning: 0,
         }
     }
     /// What we may still lend.
@@ -460,6 +464,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             if old != booked {
                 self.dirty = true;
             }
+            if booked < old {
+                q.returning += old - booked;
+            }
             q.lent = q.lent - old + booked;
             // Give what we can of what is wanted; earmark and ask upward for the rest.
             let give = it.wanted.min(q.room());
@@ -559,6 +566,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             for c in gone {
                 if let Some(b) = q.children.remove(&c) {
                     q.lent -= b.granted;
+                    q.returning += b.granted;
                     self.dirty = true;
                 }
             }
@@ -729,6 +737,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         for q in self.quotas.values_mut() {
             if let Some(b) = q.children.remove(c) {
                 q.lent -= b.granted;
+                q.returning += b.granted;
                 self.dirty = true;
             }
         }
@@ -828,6 +837,13 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let in_play = q.granted > 0 || q.reported > 0 || q.lent > 0 || q.want() > 0;
             if !in_play {
                 continue;
+            }
+            // What a child gave back was fetched for it: hand it back up, less what we want
+            // ourselves, or a share that moved is used twice, here and under its new parent.
+            if q.returning > 0 {
+                let back = q.returning.min(q.room()).saturating_sub(q.wanted);
+                q.granted -= back;
+                q.returning = 0;
             }
             // While the bucket is full we are not using our share: keep one chunk beyond
             // what we lent, and never what a child is waiting for; hand back the rest.
@@ -1213,5 +1229,46 @@ mod tests {
         assert_eq!(l.stats(&RPS).unwrap().tokens, 30, "nothing drawn");
         assert!(l.acquire(&[(RPS, 1), ("bps", 1)]).is_ok());
         assert_eq!(l.stats(&RPS).unwrap().tokens, 29);
+    }
+
+    #[test]
+    fn a_share_a_child_gave_back_goes_back_up() {
+        let mut ns = vec![node(1), node(2), node(3)];
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3]), 1, 1);
+        }
+        ns[1].set_upstream(1);
+        ns[2].set_upstream(2);
+        route(&mut ns);
+        let _ = ns[2].acquire(&[(RPS, 1)]);
+        for _ in 0..6 {
+            step(&mut ns);
+        }
+        assert_eq!(ns[2].stats(&RPS).unwrap().granted, 2);
+        assert_eq!(ns[1].stats(&RPS).unwrap().lent, 2);
+        assert_eq!(
+            ns[0].stats(&RPS).unwrap().lent,
+            2,
+            "the leader lent 2 to the middle node"
+        );
+        // The grandchild moves under the leader; the middle node is told.
+        ns[2].set_upstream(1);
+        ns[2].set_upstream(1);
+        route(&mut ns);
+        assert_eq!(ns[1].stats(&RPS).unwrap().lent, 0);
+        // The middle node does not keep the 2 for itself: at its next call it hands it up.
+        for _ in 0..3 {
+            step(&mut ns);
+        }
+        assert_eq!(
+            ns[1].stats(&RPS).unwrap().granted,
+            0,
+            "handed back, it wanted nothing"
+        );
+        assert_eq!(
+            ns[0].stats(&RPS).unwrap().lent,
+            2,
+            "the leader books only the grandchild"
+        );
     }
 }
