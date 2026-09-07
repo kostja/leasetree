@@ -28,9 +28,11 @@
 //! changed or the term did, and while it wants something: after a round trip at first, then
 //! twice as long after each empty answer, up to `ttl / 8`. A request reports, per limit,
 //! what the child holds from the parent (less than before is a release) and what more it
-//! wants. A response grants. The parent gives what it has, remembers the rest for this child
-//! and asks its own parent for it, and what it fetches for a waiting child it never hands
-//! back as spare. The parent never calls the child.
+//! wants, apart from what it *needs*: what it has already lent beyond its share, a moved
+//! subtree it adopted. A response grants. The parent serves needs before wants, from all the
+//! tree, and reserves room for a child's need it could not fill; what it fetches for a
+//! waiting child it never hands back as spare. Without that, a share that moved is counted
+//! twice for as long as the rate is contended. The parent never calls the child.
 //!
 //! # The contract
 //!
@@ -107,6 +109,10 @@ pub struct RequestItem<K> {
     /// What the child holds from the parent. Less than before is a release; zero to an old
     /// parent lets it go entirely.
     pub granted: u64,
+    /// What the child has already lent beyond its share: a moved subtree it adopted. Served
+    /// before any `wanted`, by everyone up the tree, or a moved share is counted twice for
+    /// as long as the rate is contended.
+    pub needed: u64,
     /// What more the child would take.
     pub wanted: u64,
 }
@@ -197,6 +203,9 @@ struct Booking {
     /// What the child asked for and did not get: earmarked, so that what we fetch for it is
     /// not handed back as spare before it asks again.
     wanted: u64,
+    /// What the child needs and did not get: reserved, so that no want is served from room
+    /// while a need is outstanding.
+    needed: u64,
 }
 
 /// One limit's state on this node.
@@ -254,12 +263,21 @@ impl<Id: Ord + Clone> Quota<Id> {
     fn earmarked(&self) -> u64 {
         self.children.values().map(|b| b.wanted).sum()
     }
-    /// What to ask the parent for: our own want, the children's, and what we lent beyond
-    /// what we hold.
+    /// What the children need and did not get.
+    fn reserved(&self) -> u64 {
+        self.children.values().map(|b| b.needed).sum()
+    }
+    /// What we need from the parent: what we and our children lent beyond our share.
+    fn need(&self) -> u64 {
+        self.overcommit().saturating_add(self.reserved())
+    }
+    /// What we would take from the parent beyond that: our own want and the children's.
     fn want(&self) -> u64 {
-        self.wanted
-            .saturating_add(self.earmarked())
-            .saturating_add(self.overcommit())
+        self.wanted.saturating_add(self.earmarked())
+    }
+    /// Everything we ask for.
+    fn ask(&self) -> u64 {
+        self.need().saturating_add(self.want())
     }
 }
 
@@ -468,11 +486,20 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 q.returning += old - booked;
             }
             q.lent = q.lent - old + booked;
-            // Give what we can of what is wanted; earmark and ask upward for the rest.
-            let give = it.wanted.min(q.room());
+            // Needs first, from all the room; wants only from room not reserved for other
+            // children's needs. Remember the rest and ask upward for it.
+            let others_need = q.reserved() - q.children.get(&from).map_or(0, |b| b.needed);
+            let give_need = it.needed.min(q.room());
+            let free = q
+                .room()
+                .saturating_sub(give_need)
+                .saturating_sub(others_need);
+            let give_want = it.wanted.min(free);
+            let give = give_need + give_want;
             q.lent += give;
-            let short = it.wanted - give;
-            if short > 0 && can_ask {
+            let short_need = it.needed - give_need;
+            let short_want = it.wanted - give_want;
+            if (short_need > 0 || short_want > 0) && can_ask {
                 // New demand from below: ask upward at the next tick.
                 q.last_request = None;
             }
@@ -481,13 +508,15 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 expires: 0,
                 given_at: 0,
                 wanted: 0,
+                needed: 0,
             });
             b.granted = booked + give;
             if give > 0 {
                 b.given_at = now;
             }
             b.expires = now + ttl;
-            b.wanted = short;
+            b.wanted = short_want;
+            b.needed = short_need;
             items.push(ResponseItem {
                 key: it.key,
                 grant: give,
@@ -497,7 +526,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         let still = self.quotas.values().any(|q| {
             q.children
                 .get(&from)
-                .is_some_and(|b| b.granted > 0 || b.wanted > 0)
+                .is_some_and(|b| b.granted > 0 || b.wanted > 0 || b.needed > 0)
         });
         if !still {
             for q in self.quotas.values_mut() {
@@ -536,10 +565,10 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 q.reported += it.grant;
                 // What arrived goes to the children waiting for it first; only the rest
                 // counts against our own want, or a child would take what we asked for.
-                let for_children = q.earmarked().min(it.grant);
-                q.wanted = q.wanted.saturating_sub(it.grant - for_children);
+                let spoken_for = q.need().saturating_add(q.earmarked()).min(it.grant);
+                q.wanted = q.wanted.saturating_sub(it.grant - spoken_for);
                 q.refusals = 0;
-            } else if q.want() > 0 {
+            } else if q.ask() > 0 {
                 q.refusals = q.refusals.saturating_add(1);
             }
             q.valid_until = Some(q.valid_until.unwrap_or(0).max(resp.in_reply_to + ttl));
@@ -799,6 +828,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 .map(|k| RequestItem {
                     key: k.clone(),
                     granted: 0,
+                    needed: 0,
                     wanted: 0,
                 })
                 .collect(),
@@ -819,7 +849,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let wait = (2u64 << q.refusals.saturating_sub(1).min(16))
                 .min(cap)
                 .max(1);
-            q.want() > 0 && q.last_request.map_or(true, |t| now >= t + wait)
+            q.ask() > 0 && q.last_request.map_or(true, |t| now >= t + wait)
         })
     }
 
@@ -834,7 +864,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         self.last_call = now;
         let mut items = Vec::new();
         for (key, q) in self.quotas.iter_mut() {
-            let in_play = q.granted > 0 || q.reported > 0 || q.lent > 0 || q.want() > 0;
+            let in_play = q.granted > 0 || q.reported > 0 || q.lent > 0 || q.ask() > 0;
             if !in_play {
                 continue;
             }
@@ -853,19 +883,21 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 let keep = q
                     .lent
                     .saturating_add(q.limit.chunk)
-                    .saturating_add(q.earmarked());
+                    .saturating_add(q.earmarked())
+                    .saturating_add(q.reserved());
                 if q.granted > keep {
                     q.granted = keep;
                 }
             }
-            let want = q.want();
-            if want > 0 {
+            let (need, want) = (q.need(), q.want());
+            if need > 0 || want > 0 {
                 q.last_request = Some(now);
             }
             q.reported = q.granted;
             items.push(RequestItem {
                 key: key.clone(),
                 granted: q.granted,
+                needed: need,
                 wanted: want,
             });
         }
@@ -918,6 +950,20 @@ mod tests {
                 break;
             }
         }
+    }
+
+    fn dump(ns: &[Lease<u32, &'static str>]) -> String {
+        ns.iter()
+            .map(|n| {
+                format!(
+                    "{}: {:?} parent {:?}",
+                    n.me,
+                    n.stats(&RPS).unwrap(),
+                    n.parent()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     /// One tick everywhere, then every call and answer.
@@ -1271,5 +1317,59 @@ mod tests {
             2,
             "the leader books only the grandchild"
         );
+    }
+
+    #[test]
+    fn a_moved_share_is_needed_and_served_before_any_want() {
+        // The rate is fully lent: A and B hold 2 each, D holds 2 under B. D moves under A: A
+        // is over-committed by 2, B gives the 2 back up, and C wants 2 at the same time. A's
+        // need is served first.
+        let mut ns: Vec<Lease<u32, &'static str>> = (1..=5)
+            .map(|id| {
+                let mut n = Lease::new(id, Config { ttl: 40 });
+                n.set_limit(RPS, Limit { limit: 6, chunk: 2 });
+                n
+            })
+            .collect();
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3, 4, 5]), 1, 1);
+        }
+        ns[1].set_upstream(1); // A
+        ns[2].set_upstream(1); // B
+        ns[3].set_upstream(3); // D under B
+        ns[4].set_upstream(1); // C
+        route(&mut ns);
+        // A, B and D keep writing, as real nodes do; a write that fails asks again.
+        for _ in 0..16 {
+            for i in [1, 2, 3] {
+                let _ = ns[i].acquire(&[(RPS, 1)]);
+            }
+            step(&mut ns);
+        }
+        assert_eq!(
+            ns[0].stats(&RPS).unwrap().lent,
+            6,
+            "fully lent\n{}",
+            dump(&ns)
+        );
+        ns[3].set_upstream(2);
+        ns[3].set_upstream(2); // D moves under A
+        for _ in 0..12 {
+            for i in [1, 2, 3, 4] {
+                let _ = ns[i].acquire(&[(RPS, 1)]); // C wants too, and keeps asking
+            }
+            step(&mut ns);
+        }
+        let a = ns[1].stats(&RPS).unwrap();
+        assert_eq!(a.overcommit, 0, "A's need was served\n{}", dump(&ns));
+        assert_eq!(ns[4].stats(&RPS).unwrap().granted, 0, "C's want was not");
+        let refills: u64 = ns
+            .iter()
+            .map(|n| {
+                let s = n.stats(&RPS).unwrap();
+                s.granted.saturating_sub(s.lent)
+            })
+            .sum();
+        assert!(refills <= 6, "the rate is not over-allocated: {refills}");
     }
 }
