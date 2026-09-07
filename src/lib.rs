@@ -316,6 +316,13 @@ impl<Id: Ord + Clone> Quota<Id> {
     fn earmarked(&self) -> u64 {
         self.children.values().map(|b| b.wanted).sum()
     }
+    /// What to ask the parent for: our own want, the children's, and what we lent beyond
+    /// what we hold.
+    fn want(&self) -> u64 {
+        self.wanted
+            .saturating_add(self.earmarked())
+            .saturating_add(self.overcommit())
+    }
     /// The parent books less than we hold: give the difference back, what is unspent of it.
     /// What we cannot give back our children hold; they get it in their next answers.
     fn cut_to(&mut self, hold: u64) -> bool {
@@ -575,10 +582,9 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             q.lent += give;
             let short = it.wanted - give;
             if short > 0 && !settling && can_ask {
-                if q.wanted == 0 {
-                    q.last_request = None;
-                }
-                q.wanted = q.wanted.max(short);
+                // New demand from below: ask upward at the next tick. It is remembered on
+                // the child's booking, and added to our own want when we ask.
+                q.last_request = None;
             }
             let overcommit = q.overcommit();
             let is_stock = q.limit.is_stock();
@@ -656,7 +662,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 q.reported += it.grant;
                 q.wanted = q.wanted.saturating_sub(it.grant);
                 q.refusals = 0;
-            } else if q.wanted > 0 {
+            } else if q.want() > 0 {
                 q.refusals = q.refusals.saturating_add(1);
             }
             q.term = q.term.max(resp.term);
@@ -743,6 +749,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
     pub fn acquire(&mut self, keys: &[(K, u64)]) -> Result<(), Denied<K>> {
         let leader = self.is_leader();
         let (term, now) = (self.term, self.now);
+        let mut denied = None;
         for (key, amount) in keys {
             let Some(q) = self.quotas.get_mut(key) else {
                 continue;
@@ -763,12 +770,16 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
                 }
                 q.wanted = q.wanted.max(q.limit.chunk()).max(*amount);
             }
-            if !ok {
-                return Err(Denied {
+            if !ok && denied.is_none() {
+                // Refused, but keep going: every short key in the call is marked wanted.
+                denied = Some(Denied {
                     key: key.clone(),
                     available: have,
                 });
             }
+        }
+        if let Some(d) = denied {
+            return Err(d);
         }
         for (key, amount) in keys {
             let Some(q) = self.quotas.get_mut(key) else {
@@ -1028,7 +1039,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
         }
         let cap = Self::grace(self.cfg.ttl);
         self.quotas.values().any(|q| {
-            let want = q.wanted.max(q.overcommit());
+            let want = q.want();
             let wait = (2u64 << q.refusals.saturating_sub(1).min(16))
                 .min(cap)
                 .max(1);
@@ -1052,7 +1063,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             let in_play = q.cap.granted() > 0
                 || q.reported > 0
                 || q.lent > 0
-                || q.wanted > 0
+                || q.want() > 0
                 || (q.limit.is_stock() && q.cap.global_used() > 0);
             if !in_play {
                 continue;
@@ -1074,7 +1085,7 @@ impl<Id: Ord + Clone, K: Ord + Clone> Lease<Id, K> {
             if spare > keep {
                 let _ = q.cap.reclaim(spare - keep);
             }
-            let want = q.wanted.max(q.overcommit());
+            let want = q.want();
             if want > 0 {
                 q.last_request = Some(now);
             }
@@ -1752,5 +1763,175 @@ mod tests {
         );
         assert_eq!(c.stats(&BYTES).unwrap().granted, 100);
         assert_eq!(c.term(), 5);
+    }
+
+    /// A leader with a stock of 300 and a rate of 30, lent out entirely: A holds 100, B holds
+    /// 200 of which it lent 100 to its child D. Everyone has used a little. Then B moves under
+    /// A, which adopts 200 it does not have.
+    fn full_quota_then_a_move() -> Vec<Lease<u32, &'static str>> {
+        let small_stock = Limit::Stock {
+            limit: 300,
+            chunk: 100,
+            acquired: 0,
+            released: 0,
+        };
+        let mut ns: Vec<Lease<u32, &'static str>> = (1..=4)
+            .map(|id| {
+                let mut n = Lease::new(id, Config { ttl: 40 });
+                n.set_limit(BYTES, small_stock);
+                n.set_limit(RPS, rate());
+                n
+            })
+            .collect();
+        for n in ns.iter_mut() {
+            n.set_cluster_view(Some(&[1, 2, 3, 4]), 1, 1);
+        }
+        ns[1].set_upstream(1); // A
+        ns[2].set_upstream(1); // B
+        ns[3].set_upstream(3); // D under B
+        route(&mut ns);
+        for n in ns[1..].iter_mut() {
+            let _ = n.acquire(&[(BYTES, 10), (RPS, 1)]);
+        }
+        for _ in 0..12 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+            route(&mut ns);
+        }
+        for n in ns[1..].iter_mut() {
+            n.acquire(&[(BYTES, 10)]).unwrap();
+        }
+        assert_eq!(
+            ns[0].stats(&BYTES).unwrap().lent,
+            300,
+            "the quota is fully lent"
+        );
+        assert_eq!(
+            ns[2].stats(&BYTES).unwrap().granted,
+            200,
+            "B holds its chunk and D's"
+        );
+        assert_eq!(ns[3].stats(&BYTES).unwrap().granted, 100);
+        // B moves under A. Rule 4 hands B's old booking back to the leader; the leader
+        // spends that room itself, so A cannot fetch it and the quota is full again.
+        ns[2].set_upstream(2);
+        ns[2].set_upstream(2);
+        route(&mut ns);
+        assert_eq!(ns[1].stats(&BYTES).unwrap().lent, 200, "A adopted B");
+        assert!(
+            ns[1].stats(&BYTES).unwrap().overcommit > 0,
+            "and holds no such room"
+        );
+        ns[0].acquire(&[(BYTES, 200)]).unwrap();
+        assert_eq!(ns[0].stats(&BYTES).unwrap().overcommit, 0);
+        ns
+    }
+
+    /// One tick everywhere, then every call and answer.
+    fn step(ns: &mut [Lease<u32, &'static str>]) {
+        for n in ns.iter_mut() {
+            n.tick(1);
+        }
+        route(ns);
+    }
+
+    #[test]
+    fn an_adoption_beyond_room_is_cut_after_the_grace_and_never_below_usage() {
+        let mut ns = full_quota_then_a_move();
+        // Within the grace period (ttl / 8 = 5) nothing is cut, however often B calls.
+        for _ in 0..4 {
+            step(&mut ns);
+            assert_eq!(ns[2].stats(&BYTES).unwrap().granted, 200, "not yet");
+        }
+        // After it, B's next call is answered with a cut. B calls at its keepalive, so
+        // within ttl / 2.
+        for _ in 0..20 {
+            step(&mut ns);
+        }
+        let b = ns[2].stats(&BYTES).unwrap();
+        assert!(b.granted < 200, "cut: {b:?}");
+        assert!(b.granted >= 20, "never below what the subtree used: {b:?}");
+        assert!(ns[2].usage(&BYTES) <= b.granted);
+    }
+
+    #[test]
+    fn a_cut_walks_down_to_the_grandchild_in_its_next_answer() {
+        let mut ns = full_quota_then_a_move();
+        for _ in 0..48 {
+            step(&mut ns);
+        }
+        let d = ns[3].stats(&BYTES).unwrap();
+        assert!(d.granted < 100, "D was cut too: {d:?}");
+        assert!(d.granted >= 10, "but not below its own usage: {d:?}");
+        // The tree fits again: nobody books more than it holds.
+        for n in &ns {
+            assert_eq!(
+                n.stats(&BYTES).unwrap().overcommit,
+                0,
+                "node {} still over",
+                n.me
+            );
+        }
+        assert!(ns[0].usage(&BYTES) <= 300);
+    }
+
+    #[test]
+    fn a_rate_is_never_cut() {
+        let mut ns = full_quota_then_a_move();
+        let share = ns[2].stats(&RPS).unwrap().granted;
+        assert!(share > 0);
+        for _ in 0..24 {
+            step(&mut ns);
+        }
+        assert_eq!(ns[2].stats(&RPS).unwrap().granted, share, "the share stays");
+        // Even in an answer that cuts the stock, the rate's hold is what the child holds.
+        let _ = ns[2].acquire(&[(BYTES, 1000)]); // something to call about
+        ns[2].tick(1);
+        let Action::Call(to, req) = ns[2]
+            .ready()
+            .into_iter()
+            .find(|Action::Call(t, _)| *t == 2)
+            .unwrap();
+        let resp = ns[(to - 1) as usize].on_request(3, req);
+        let r = resp.items.iter().find(|i| i.key == RPS).unwrap();
+        assert_eq!(r.hold, share);
+    }
+
+    #[test]
+    fn a_cut_is_answered_not_pushed_and_the_child_gives_back_only_the_unspent() {
+        let mut ns = full_quota_then_a_move();
+        for _ in 0..6 {
+            for n in ns.iter_mut() {
+                n.tick(1);
+            }
+        }
+        // B calls A after the grace: the answer's hold is below what B holds.
+        let _ = ns[2].acquire(&[(BYTES, 1000)]); // something to call about
+        ns[2].tick(1);
+        let Action::Call(to, req) = ns[2]
+            .ready()
+            .into_iter()
+            .find(|Action::Call(t, _)| *t == 2)
+            .unwrap();
+        assert_eq!(to, 2);
+        let resp = ns[1].on_request(3, req);
+        let item = resp.items.iter().find(|i| i.key == BYTES).unwrap();
+        assert!(item.hold < 200, "a cut: hold {}", item.hold);
+        assert!(item.hold >= 20, "never below the subtree's usage");
+        let hold = item.hold;
+        ns[2].on_response(2, resp);
+        // B gave back everything it had not spent itself, down to the hold; what it had lent
+        // to D it now holds beyond its lease, and D learns of that in its next answer.
+        let b = ns[2].stats(&BYTES).unwrap();
+        assert_eq!(
+            b.granted,
+            hold.max(10),
+            "down to the hold, never below own usage"
+        );
+        assert!(
+            b.overcommit > 0,
+            "and over-committed towards D until D is cut"
+        );
     }
 }
