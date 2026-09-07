@@ -215,10 +215,37 @@ Fetching first keeps it rare; only a second, parent-initiated RPC would make the
 and that is not worth the second RPC: a stock is capacity that fills over days, and a leader
 change is seconds. This crate is not a billing boundary.
 
+**A node's parent is the peer the overlay delivers the leader's traffic through; it moves to
+a new deliverer once that peer has delivered twice in a row, and never to its own child.**
+The lease tree has no shape of its own. It follows the overlay's tree rooted at the leader,
+and follows its changes: when plumtree swaps a link for a cheaper one, the deliverer changes
+for good, and two deliveries later so does the lease's parent, with one release and one
+adoption as under the rule above. What it does not follow is a single detour: a lost copy
+fetched from a lazy peer changes the deliverer for one message and then changes back, and
+without the two-in-a-row rule every such repair moved a lease. Node C, parent P, the leader
+sending every 5 ticks:
+
+| tick | delivered through | in a row | C's parent |
+|---|---|---|---|
+| 100 | P | | P |
+| 105 | Q, P's copy was lost | 1 | P |
+| 110 | P | | P |
+| 115 | Q, plumtree swapped to Q | 1 | P |
+| 120 | Q | 2 | Q; the lease moves |
+
+Measured in the simulator at N=200: with no loss, every node's parent is the peer the
+overlay delivers through, in one data centre and across two; at 5% loss, 188 and 176 of 199,
+the rest being nodes inside the two-delivery lag of a swap in progress. So the lease tree is
+as local to a data centre as the overlay is, and the overlay's cost rules decide that. The
+own-child refusal is for the turn-around after a leader change: the old leader L, with child
+A whose child L' is now the leader, hears the new leader through A; taking A as parent while
+A still had L as parent would book each other's leases in a loop with no path to the leader.
+L waits; A switches to L' after two deliveries and releases from L; then L may take A. The
+cost of the rule is that a dead parent is left after two of the leader's periods rather than
+one, while the lease is still good for a full `ttl`.
+
 The remaining rules, in short:
 
-- A node keeps its parent while that parent keeps delivering the leader's traffic, and never
-  takes its own child as parent.
 - A node drops a lease the moment it lapses: the parent has re-lent that room.
 - A new leader grants nothing and cuts nobody until its reports cover every live member, or one
   `ttl` has passed.
